@@ -1,0 +1,9 @@
+#!/bin/bash
+# PAM-хук (/etc/pam.d/sshd): уведомление о входе по SSH, не чаще раза в 2 минуты на пару user+host
+[ "$PAM_TYPE" = "open_session" ] || exit 0
+KEY="/run/srvbot-ssh-${PAM_USER}-${PAM_RHOST}"
+NOW=$(date +%s)
+if [ -f "$KEY" ] && [ $((NOW - $(cat "$KEY"))) -lt 120 ]; then exit 0; fi
+echo "$NOW" > "$KEY"
+/usr/local/bin/srvbot-notify "🔑 SSH: вход ${PAM_USER} с ${PAM_RHOST}" >/dev/null 2>&1 &
+exit 0

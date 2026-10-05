@@ -1,0 +1,6 @@
+[Unit]
+Description=Уведомление, если srvbot упал и не поднялся
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'sleep 60; systemctl is-active -q srvbot || /usr/local/bin/srvbot-notify "⚠️ бот мониторинга упал и не поднимается: journalctl -u srvbot"'

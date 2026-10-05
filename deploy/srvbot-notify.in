@@ -1,0 +1,3 @@
+#!/bin/sh
+# Сообщение владельцу через бота мониторинга: srvbot-notify [--button "Текст=callback"]... "текст"
+cd "@DIR@" && exec /usr/bin/python3 -m srvbot.notify "$@"

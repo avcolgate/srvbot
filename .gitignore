@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+# секреты и состояние живут вне репозитория (/etc/srvbot.env, /var/lib/srvbot), но на всякий случай:
+*.env
+!srvbot.env.example
+state.json

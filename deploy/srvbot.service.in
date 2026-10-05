@@ -1,0 +1,18 @@
+[Unit]
+Description=Telegram-бот мониторинга сервера
+After=network-online.target docker.service
+Wants=network-online.target
+OnFailure=srvbot-fail.service
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+WorkingDirectory=@DIR@
+ExecStart=/usr/bin/python3 -m srvbot
+Restart=always
+RestartSec=10
+MemoryMax=200M
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
