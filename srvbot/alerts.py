@@ -6,7 +6,7 @@ from datetime import datetime
 
 from . import checkhost, config, docker, manage, report, system, tunnel
 from .tg import Bot, kb
-from .util import CmdError, State, cut_html, esc, fmt_duration
+from .util import CmdError, State, cut_html, esc, fmt_bytes, fmt_duration
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +32,10 @@ class Alerts:
         self.ctrs: dict[str, docker.Container] | None = None   # контейнеры по последней проверке; None — docker не ответил
         self.cpu = system.CpuMeter()
         self.name_wait: dict[str, int] = {}  # новые клиенты без имени: сколько проверок уже ждём
+        self.peer_rx: dict[str, int] = {}      # ключ клиента -> принято байт на прошлой проверке
+        self.online_prev: dict[str, int] = {}  # контейнер -> сколько клиентов было в сети на прошлой проверке
+        self.mass_drop: set[str] = set()       # контейнеры, где все клиенты пропали разом
+        self.geo_nodes: dict = {}              # кэш узлов check-host для проверки из страны
 
     async def send(self, text: str, markup=None, reply_to: int | None = None) -> dict | None:
         """Отправленное сообщение или None, если Telegram не принял."""
@@ -109,13 +113,13 @@ class Alerts:
                        markup=buttons(("🧹 Очистить диск", "nv:clean")))
         await self.set("cpu", m.cpu_pct >= config.CPU_PCT, "CPU",
                        f"загрузка {m.cpu_pct:.0f}% уже {config.SUSTAIN_CHECKS} мин", sustain=config.SUSTAIN_CHECKS,
-                       markup=buttons(("📊 Статус", "nv:status"), ("🔧 Службы", "nv:svc")))
+                       markup=buttons(("📊 Сервер", "nv:status"), ("🔧 Службы", "nv:svc")))
         psi = m.mem_psi_full or 0
         mem_bad = m.mem_avail_pct < config.MEM_AVAIL_PCT or psi >= config.MEM_PSI_FULL
         await self.set("mem", mem_bad, "память",
                        f"доступно {m.mem_avail_pct:.0f}% RAM, давление {psi:.0f}% уже {config.SUSTAIN_CHECKS} мин",
                        sustain=config.SUSTAIN_CHECKS,
-                       markup=buttons(("📊 Статус", "nv:status"), ("🔧 Службы", "nv:svc")))
+                       markup=buttons(("📊 Сервер", "nv:status"), ("🔧 Службы", "nv:svc")))
 
     async def check_ports(self):
         cur, stale = system.listening()
@@ -160,8 +164,9 @@ class Alerts:
         ips = system.public_ipv4()
         await self.set("ip:none", not ips, "внешний IP", "на интерфейсах нет ни одного внешнего IPv4", sustain=2)
         prev = self.state.data.get("public_ips")
-        if ips and prev != ips:
+        if ips and (prev != ips or "ip_since" not in self.state.data):
             self.state["public_ips"] = ips
+            self.state["ip_since"] = time.time()  # с какого момента сервер живёт на этом адресе
             self.state.save()
             if prev is not None:
                 await self.send(f"🌐 <b>IP сервера изменился</b>: {esc(', '.join(prev) or '—')} → "
@@ -178,6 +183,7 @@ class Alerts:
         # иначе эмодзи перетасуются
         if tunnel.assign_emoji(emojis, keys, forget_missing=bool(ok) and len(ok) == len(insts)):
             self.state.save()
+        now = time.time()
         for inst in insts:
             await self.set(f"tunnel:{inst.container}", bool(inst.running and inst.error),
                            f"туннель {inst.container}", f"не удалось прочитать данные: {inst.error}",
@@ -185,6 +191,7 @@ class Alerts:
                                                      ("📜 Журнал", f"la:c:{inst.container}")))
             if inst.error:
                 continue
+            await self.check_blocking(inst, emojis, now)
             current = {p.pubkey for p in inst.peers}
             if inst.container not in known:  # первый запуск или новый контейнер — запоминаем молча
                 known[inst.container] = sorted(current)
@@ -206,6 +213,52 @@ class Alerts:
             if updated != known[inst.container]:
                 known[inst.container] = updated
                 self.state.save()
+        if ok and len(ok) == len(insts):  # все контейнеры прочитаны — удалённых клиентов можно забыть
+            current = {p.pubkey for i in ok for p in i.peers}
+            for key in [k for k in self.active if k.startswith("hs:") and k[3:] not in current]:
+                info = self.active[key] if isinstance(self.active[key], dict) else {}
+                await self.set(key, False, info.get("title", "клиент"))
+            for k in [k for k in self.peer_rx if k not in current]:
+                del self.peer_rx[k]
+        await self.check_traffic(ok)
+
+    async def check_blocking(self, inst: tunnel.Instance, emojis: dict[str, str], now: float):
+        """Два ранних признака блокировки адреса: клиент шлёт пакеты без рукопожатия (сеть режет начало
+        соединения) и все клиенты пропали разом (пакеты перестали доходить вовсе)."""
+        links = buttons(("🌍 Доступность", "nv:geo"), ("🔐 Клиенты", "nv:tun"))
+        for p in inst.peers:
+            em = emojis.get(p.pubkey, "")
+            await self.set(f"hs:{p.pubkey}", tunnel.stalled(p, self.peer_rx.get(p.pubkey), now),
+                           f"клиент {em + ' ' if em else ''}{p.label}",
+                           "шлёт пакеты, но рукопожатие не проходит — похоже, сеть режет начало соединения",
+                           sustain=config.TUNNEL_STALL_CHECKS, markup=links)
+            self.peer_rx[p.pubkey] = p.rx
+        online = sum(tunnel.is_online(p, now) for p in inst.peers)
+        prev = self.online_prev.get(inst.container, 0)
+        self.online_prev[inst.container] = online
+        if tunnel.mass_drop(prev, online):
+            self.mass_drop.add(inst.container)
+        elif online:
+            self.mass_drop.discard(inst.container)
+        await self.set(f"drop:{inst.container}", inst.container in self.mass_drop, f"клиенты {inst.container}",
+                       f"все {prev} клиентов пропали одновременно — похоже на блокировку адреса сервера",
+                       markup=links)
+        if inst.container in self.mass_drop and prev and config.GEO_COUNTRY:
+            try:  # внеочередная проверка из страны — её алерт придёт следом
+                await self.check_geo(self.geo_nodes)
+            except Exception:
+                log.exception("check geo after mass drop failed")
+
+    async def check_traffic(self, insts: list[tunnel.Instance]):
+        """Объём трафика повышает риск блокировки адреса — раз в день предупреждаем о превышении порога."""
+        today = datetime.now(config.TZ).date().isoformat()
+        day, rx, tx = report.day_traffic(self.state.data.get("traffic_day"), insts, today)
+        self.state["traffic_day"] = day
+        if rx + tx >= config.TRAFFIC_DAY_GB * 2**30 and self.state.data.get("traffic_warned") != today:
+            if await self.send(f"📈 <b>Трафик за сегодня</b> уже {fmt_bytes(rx + tx)} (↓{fmt_bytes(tx)} ↑{fmt_bytes(rx)}): "
+                               f"объём трафика повышает риск блокировки адреса",
+                               buttons(("🔐 Клиенты", "nv:tun"))):
+                self.state["traffic_warned"] = today
 
     async def check_upgrade(self):
         """Обновления ставятся в отдельном юните; когда он закончился — сообщаем результат."""
@@ -239,25 +292,43 @@ class Alerts:
             return
         ssh = [p for p, proc in system.listening()[0].items() if proc == "sshd" and p.startswith("tcp/")]
         target = f"{ips[0]}:{ssh[0].split('/')[1] if ssh else 22}"
-        res = await checkhost.check(self.bot.pool, target, nodes["target"] + nodes["ctl"])
-        v = checkhost.verdict(res, nodes["target"], nodes["ctl"])
-        self.state["geo_last"] = {"ts": time.time(), "target": target, "cc": config.GEO_COUNTRY, **v.to_dict()}
+        all_nodes = nodes["target"] + nodes["ctl"]
+        # TCP к порту SSH и ping параллельно: узел недоступен, только если не прошло ни то ни другое
+        tcp, ping = await asyncio.gather(checkhost.check(self.bot.pool, target, all_nodes),
+                                         checkhost.check(self.bot.pool, ips[0], all_nodes, kind="ping"),
+                                         return_exceptions=True)
+        if isinstance(tcp, BaseException):
+            raise tcp
+        if isinstance(ping, BaseException):
+            log.warning("check-host ping: %s", ping)
+            ping = None
+        info = await asyncio.get_running_loop().run_in_executor(self.bot.pool, checkhost.node_info)
+        v = checkhost.verdict(checkhost.combine(tcp, ping), nodes["target"], nodes["ctl"], info)
+        now = time.time()
+        self.state["geo_last"] = {"ts": now, "target": target, "cc": config.GEO_COUNTRY, **v.to_dict()}
+        hist = [h for h in self.state.get("geo_hist", []) if now - h[0] < 86400]  # проверки за сутки
+        self.state["geo_hist"] = hist + [[int(now), v.ok, v.fail]]
         self.state.save()
         if v.down or v.reachable:  # иначе данных мало (узлы не ответили) — состояние не меняем
             flag = checkhost.flag(config.GEO_COUNTRY)
-            await self.set("geo", v.down, f"доступ из {flag}",
-                           f"{target} не отвечает с {v.fail} из {v.total} узлов check-host.net в {flag} "
-                           f"({', '.join(v.failed)}), а с контрольных доступен ({v.ctl_ok}/{v.ctl_total})",
+            how = "ни TCP, ни ping" if ping else "TCP"
+            if v.partial:
+                problem = (f"{target} недоступен с {v.fail} из {v.total} узлов check-host.net в {flag} "
+                           f"({', '.join(v.failed)}; {how}), с остальных доступен — похоже на блокировку "
+                           f"у части провайдеров")
+            else:
+                problem = (f"{target} недоступен со всех {v.total} узлов check-host.net в {flag} ({how}), "
+                           f"а с контрольных доступен ({v.ctl_ok}/{v.ctl_total})")
+            await self.set("geo", v.down, f"доступ из {flag}", problem,
                            sustain=config.GEO_SUSTAIN, markup=buttons(("🌍 Проверить по миру", "nv:geo")))
 
     async def run_geo(self):
         if not config.GEO_COUNTRY:
             return
-        nodes: dict = {}
         await asyncio.sleep(30)  # дать боту стартовать
         while True:
             try:
-                await self.check_geo(nodes)
+                await self.check_geo(self.geo_nodes)
             except checkhost.CheckHostError as e:
                 log.warning("check-host: %s", e)
             except Exception:

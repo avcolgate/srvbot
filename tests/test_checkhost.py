@@ -19,6 +19,28 @@ class ParseTcp(unittest.TestCase):
         self.assertEqual(parsed, {"a": True, "b": False, "c": None, "d": None, "e": False})
 
 
+PING_OK = [[["OK", 0.05, "203.0.113.10"], ["OK", 0.05], ["TIMEOUT", 3.0], ["OK", 0.05]]]
+PING_BAD = [[["TIMEOUT", 3.0], ["TIMEOUT", 3.0], ["TIMEOUT", 3.0], ["TIMEOUT", 3.0]]]
+
+
+class ParsePing(unittest.TestCase):
+    def test_formats(self):
+        parsed = checkhost.parse_ping({"a": PING_OK, "b": PING_BAD, "c": None, "d": [None], "e": [[]],
+                                       "f": [{"message": "no such node"}]})
+        self.assertEqual(parsed, {"a": True, "b": False, "c": None, "d": None, "e": None, "f": False})
+
+
+class Combine(unittest.TestCase):
+    def test_either_method_counts_as_reachable(self):
+        tcp = {"a": True, "b": False, "c": False, "d": None}
+        ping = {"a": False, "b": True, "c": False, "d": True}
+        self.assertEqual(checkhost.combine(tcp, ping), {"a": True, "b": True, "c": False, "d": True})
+
+    def test_without_ping(self):
+        self.assertEqual(checkhost.combine({"a": True, "b": False, "c": None}, None),
+                         {"a": True, "b": False, "c": None})
+
+
 class Verdict(unittest.TestCase):
     def v(self, tgt, ctl):
         return checkhost.verdict(checkhost.parse_tcp(res(tgt, ctl)), TGT, CTL)
@@ -34,8 +56,17 @@ class Verdict(unittest.TestCase):
     def test_one_node_failed_is_alert(self):
         v = self.v([OK, ERR, OK], [OK, OK])
         self.assertTrue(v.down)
+        self.assertTrue(v.partial)
         self.assertFalse(v.reachable)
         self.assertEqual(v.failed, ["fr2"])
+
+    def test_all_failed_is_not_partial(self):
+        self.assertFalse(self.v([ERR, ERR, ERR], [OK, OK]).partial)
+
+    def test_failed_as_cities(self):
+        info = {TGT[1]: ("fr", "France", "Marseille")}
+        v = checkhost.verdict(checkhost.parse_tcp(res([OK, ERR, ERR], [OK, OK])), TGT, CTL, info)
+        self.assertEqual(v.failed, ["Marseille", "fr3"])
 
     def test_down_everywhere_is_not_country_specific(self):
         self.assertFalse(self.v([ERR, ERR, ERR], [ERR, ERR]).down)

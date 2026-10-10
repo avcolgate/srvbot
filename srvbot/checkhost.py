@@ -1,6 +1,6 @@
 """Доступность сервера из разных стран через check-host.net.
 
-Узлы check-host.net (~60 по миру) пробуют подключиться к TCP-порту сервера:
+Узлы check-host.net (~60 по миру) пробуют подключиться к TCP-порту сервера и пропинговать его:
 видно, из каких стран до сервера не доходят подключения.
 Сетевые функции синхронные (вызывать через executor), check() — асинхронная обёртка.
 """
@@ -57,14 +57,15 @@ def nodes(country: str) -> tuple[list[str], list[str]]:
     return target, ctl
 
 
-async def check(pool, target: str, node_list: list[str], tries: int = 5) -> dict[str, bool | None]:
-    """TCP-проверка target с указанных узлов; ждёт, пока ответят все (до ~8 с × tries)."""
+async def check(pool, target: str, node_list: list[str], tries: int = 5, kind: str = "tcp") -> dict[str, bool | None]:
+    """Проверка target с указанных узлов (kind: tcp — подключение к host:port, ping — к host);
+    ждёт, пока ответят все (до ~8 с × tries)."""
     loop = asyncio.get_running_loop()
-    rid = await loop.run_in_executor(pool, start_tcp, target, node_list)
+    rid = await loop.run_in_executor(pool, start, kind, target, node_list)
     res: dict = {}
     for _ in range(tries):
         await asyncio.sleep(8)
-        res = await loop.run_in_executor(pool, result, rid)
+        res = await loop.run_in_executor(pool, result, rid, kind)
         if res and all(v is not None for v in res.values()):
             break
     return res
@@ -94,11 +95,11 @@ def by_country(res: dict[str, bool | None], info: dict[str, tuple[str, str, str]
     return sorted(countries.values(), key=lambda c: (c.cc != first, not c.fail, c.name))
 
 
-def start_tcp(target: str, node_list: list[str]) -> str:
+def start(kind: str, target: str, node_list: list[str]) -> str:
     q = "&".join(f"node={n}" for n in node_list)
-    r = _get(f"/check-tcp?host={target}&{q}")
+    r = _get(f"/check-{kind}?host={target}&{q}")
     if not r.get("ok") or "request_id" not in r:
-        raise CheckHostError(f"check-tcp: {str(r)[:200]}")
+        raise CheckHostError(f"check-{kind}: {str(r)[:200]}")
     return r["request_id"]
 
 
@@ -115,8 +116,24 @@ def parse_tcp(res: dict) -> dict[str, bool | None]:
     return out
 
 
-def result(request_id: str) -> dict[str, bool | None]:
-    return parse_tcp(_get(f"/check-result/{request_id}"))
+def parse_ping(res: dict) -> dict[str, bool | None]:
+    """node -> True (хоть один ответ на ping) / False (все попытки неудачны) / None (ответа ещё нет).
+    Ответ узла — список попыток [["OK", 0.05, "ip"], ["TIMEOUT", 3.0], …]; пока узел не ответил — null."""
+    out: dict[str, bool | None] = {}
+    for node, v in (res or {}).items():
+        tries = v[0] if isinstance(v, list) and v else v
+        if tries is None or (isinstance(tries, list) and not tries):
+            out[node] = None
+        elif isinstance(tries, list) and all(isinstance(t, list) for t in tries):
+            out[node] = any(t and t[0] == "OK" for t in tries)
+        else:  # {"message": …} или другой неожиданный ответ — считаем неудачей
+            out[node] = False
+    return out
+
+
+def result(request_id: str, kind: str = "tcp") -> dict[str, bool | None]:
+    raw = _get(f"/check-result/{request_id}")
+    return parse_ping(raw) if kind == "ping" else parse_tcp(raw)
 
 
 @dataclass
@@ -126,7 +143,7 @@ class Verdict:
     total: int
     ctl_ok: int              # контрольные узлы в других странах
     ctl_total: int
-    failed: list[str] = field(default_factory=list)  # какие узлы целевой страны не подключились
+    failed: list[str] = field(default_factory=list)  # города целевой страны, откуда сервер недоступен
 
     @property
     def down(self) -> bool:
@@ -138,15 +155,31 @@ class Verdict:
         """Все ответившие узлы целевой страны подключились."""
         return self.ok > 0 and self.fail == 0
 
+    @property
+    def partial(self) -> bool:
+        """Недоступен лишь с части узлов страны — похоже на блокировку у отдельных провайдеров."""
+        return 0 < self.fail < self.total
+
     def to_dict(self) -> dict:
         return {"ok": self.ok, "fail": self.fail, "total": self.total,
                 "ctl_ok": self.ctl_ok, "ctl_total": self.ctl_total, "failed": self.failed}
 
 
-def verdict(res: dict[str, bool | None], target: list[str], ctl: list[str]) -> Verdict:
+def combine(tcp: dict[str, bool | None], ping: dict[str, bool | None] | None) -> dict[str, bool | None]:
+    """Итог по узлу из двух проверок: доступен, если прошла хоть одна; недоступен, если TCP не прошёл,
+    а ping не помог; нет данных, если TCP не ответил."""
+    out: dict[str, bool | None] = {}
+    for node in set(tcp) | set(ping or {}):
+        t, p = tcp.get(node), (ping or {}).get(node)
+        out[node] = True if t is True or p is True else (False if t is False else None)
+    return out
+
+
+def verdict(res: dict[str, bool | None], target: list[str], ctl: list[str],
+            info: dict[str, tuple[str, str, str]] | None = None) -> Verdict:
     failed = [n for n in target if res.get(n) is False]
     return Verdict(
         ok=sum(res.get(n) is True for n in target), fail=len(failed), total=len(target),
         ctl_ok=sum(res.get(n) is True for n in ctl), ctl_total=len(ctl),
-        failed=[n.split(".")[0] for n in failed],
+        failed=[info[n][2] if info and n in info and info[n][2] else n.split(".")[0] for n in failed],
     )

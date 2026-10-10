@@ -1,8 +1,9 @@
-"""Недельный отчёт. Приросты считаются от снимка, сохранённого при прошлом отчёте."""
+"""Недельный отчёт: что произошло за период — трафик клиентов и баны. Приросты считаются от снимка,
+сохранённого при прошлом отчёте; текущее состояние сервера — в разделе 📊 Сервер."""
 import time
 from datetime import datetime
 
-from . import config, docker, system, tunnel
+from . import config, system, tunnel
 from .util import CmdError, State, esc, fmt_bytes
 
 
@@ -11,6 +12,19 @@ def delta(cur: int, prev: int | None) -> int:
     if prev is None:
         return cur
     return cur - prev if cur >= prev else cur
+
+
+def day_traffic(day: dict | None, insts: list[tunnel.Instance], today: str) -> tuple[dict, int, int]:
+    """Трафик клиентов за сегодня: (обновлённый снимок, принято байт, отправлено байт).
+    day = {"date": "ГГГГ-ММ-ДД", "base": {"контейнер/ключ": [rx, tx]}} — счётчики на начало дня;
+    в новый день база обнуляется текущими счётчиками."""
+    cur = {f"{i.container}/{p.pubkey}": [p.rx, p.tx] for i in insts if not i.error for p in i.peers}
+    if not day or day.get("date") != today:
+        return {"date": today, "base": cur}, 0, 0
+    base = day.get("base", {})
+    rx = sum(delta(v[0], (base.get(k) or [None, None])[0]) for k, v in cur.items())
+    tx = sum(delta(v[1], (base.get(k) or [None, None])[1]) for k, v in cur.items())
+    return day, rx, tx
 
 
 def snapshot(insts: list[tunnel.Instance], jails: list[system.Jail]) -> dict:
@@ -28,24 +42,6 @@ async def build(state: State) -> tuple[str, dict]:
     now = datetime.now(config.TZ)
     period = f" (с {datetime.fromtimestamp(since, config.TZ):%d.%m %H:%M})" if since else ""
     lines = [f"<b>📋 Отчёт {now:%d.%m.%Y}</b>{period}"]
-
-    m = system.metrics()
-    lines.append(f"💾 диск {m.disk_pct:.0f}%, свободно {fmt_bytes(m.disk_free)}; "
-                 f"RAM доступно {fmt_bytes(m.mem_avail)}")
-    upd, sec = system.updates()
-    if upd:
-        lines.append(f"📦 обновлений: {upd}" + (f", из них безопасности {sec}" if sec else ""))
-    if system.reboot_required():
-        lines.append("⚠️ требуется перезагрузка")
-    try:
-        bad = [c for c in await docker.containers() if c.watched and not c.running]
-        lines += [f"🔴 {esc(c.name)}: {esc(c.status)}" for c in bad]
-    except CmdError as e:
-        lines.append(f"🔴 docker: {esc(e)}")
-    for c in await system.certs():
-        if c.days_left < config.CERT_WARN_DAYS * 2:
-            lines.append(f"🔒 сертификат {esc(c.name)} истекает через {c.days_left} дн.")
-
     try:
         insts = await tunnel.collect()
     except CmdError as e:  # docker не ответил — отчёт всё равно соберём, без раздела клиентов

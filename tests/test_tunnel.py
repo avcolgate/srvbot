@@ -155,5 +155,33 @@ class Detect(unittest.TestCase):
             self.assertTrue(tunnel.is_tunnel(mk("box", "example/tun-go:latest")))
             self.assertFalse(tunnel.is_tunnel(mk("web-1", "nginx:latest")))
 
+class BlockingSigns(unittest.TestCase):
+    """Признаки блокировки: пакеты без рукопожатия и массовое исчезновение клиентов."""
+    NOW = 1_700_000_000.0
+
+    def peer(self, handshake: int, rx: int) -> tunnel.Peer:
+        return tunnel.Peer("K", "1.2.3.4:1500", "10.0.0.5/32", handshake, rx, 0)
+
+    def test_packets_without_handshake(self):
+        self.assertTrue(tunnel.stalled(self.peer(0, 2000), prev_rx=1000, now=self.NOW))
+        old = int(self.NOW) - config.TUNNEL_ONLINE_SEC - 10
+        self.assertTrue(tunnel.stalled(self.peer(old, 2000), prev_rx=1000, now=self.NOW))
+
+    def test_fresh_handshake_is_fine(self):
+        self.assertFalse(tunnel.stalled(self.peer(int(self.NOW) - 30, 2000), prev_rx=1000, now=self.NOW))
+
+    def test_no_new_packets_is_not_stall(self):
+        self.assertFalse(tunnel.stalled(self.peer(0, 1000), prev_rx=1000, now=self.NOW))
+
+    def test_first_check_has_no_baseline(self):
+        self.assertFalse(tunnel.stalled(self.peer(0, 2000), prev_rx=None, now=self.NOW))
+
+    def test_mass_drop(self):
+        self.assertTrue(tunnel.mass_drop(2, 0))
+        self.assertFalse(tunnel.mass_drop(1, 0))
+        self.assertFalse(tunnel.mass_drop(2, 1))
+        self.assertFalse(tunnel.mass_drop(0, 0))
+
+
 if __name__ == "__main__":
     unittest.main()

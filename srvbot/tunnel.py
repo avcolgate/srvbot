@@ -247,6 +247,22 @@ def new_peers(known: list[str], inst: Instance) -> list[Peer]:
     return [p for p in inst.peers if p.pubkey not in seen]
 
 
+def is_online(p: Peer, now: float) -> bool:
+    return bool(p.handshake) and now - p.handshake < config.TUNNEL_ONLINE_SEC
+
+
+def stalled(p: Peer, prev_rx: int | None, now: float) -> bool:
+    """Пакеты от клиента приходят (счётчик вырос с прошлой проверки), а рукопожатия всё нет:
+    так выглядит сеть, которая режет начало соединения. Обычное отключение сюда не попадает —
+    отключившийся клиент ничего не шлёт."""
+    return prev_rx is not None and p.rx > prev_rx and not is_online(p, now)
+
+
+def mass_drop(prev_online: int, now_online: int) -> bool:
+    """Были в сети хотя бы двое — и пропали все разом: так выглядит блокировка адреса сервера."""
+    return prev_online >= 2 and now_online == 0
+
+
 def is_tunnel(c: docker.Container) -> bool:
     s = f"{c.name} {c.image}".lower()
     return any(m in s for m in config.TUNNEL_MATCH)

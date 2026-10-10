@@ -14,19 +14,19 @@ from .util import INTERACTIVE, CmdError, State, cut_html, esc, fmt_ago, fmt_byte
 
 log = logging.getLogger(__name__)
 
-BTN = {"status": "📊 Статус", "tun": "🔐 Клиенты", "geo": "🌍 Доступность",
-       "bans": "🛡 Баны", "report": "📋 Отчёт", "ctl": "⚙️ Управление"}
+BTN = {"status": "📊 Сервер", "tun": "🔐 Клиенты", "geo": "🌍 Доступность",
+       "report": "📋 Отчёт", "ctl": "⚙️ Управление"}
 COMMANDS = {"status": "status", "clients": "tun", "geo": "geo", "bans": "bans", "report": "report", "control": "ctl"}
 
 
 def main_kb() -> dict:
     """Клавиатура внизу чата. Кнопка клиентов — только если туннель на сервере найден."""
     top = [BTN["status"]] + ([BTN["tun"]] if tunnel.found() else []) + [BTN["geo"]]
-    return reply_kb(top, [BTN["bans"], BTN["report"], BTN["ctl"]])
+    return reply_kb(top, [BTN["report"], BTN["ctl"]])
 
 
 def bot_commands() -> list[tuple[str, str]]:
-    cmds = [("status", "Статус сервера"), ("clients", "Клиенты туннеля"),
+    cmds = [("status", "Сервер: нагрузка, службы, порты"), ("clients", "Клиенты туннеля"),
             ("geo", "Доступность из разных стран"), ("bans", "fail2ban"), ("report", "Отчёт"),
             ("control", "Управление"), ("menu", "Показать кнопки")]
     return [c for c in cmds if c[0] != "clients" or tunnel.found()]
@@ -34,7 +34,6 @@ def bot_commands() -> list[tuple[str, str]]:
 
 CTL_TEXT = "<b>⚙️ Управление</b>\nВыберите раздел. Любое действие выполняется только после подтверждения."
 CTL_KB = kb([("📦 Обновления", "v:upd"), ("🧹 Очистка диска", "v:clean")],
-            [("🔧 Службы и журналы", "v:svc")],
             [("⏻ Перезагрузить сервер", "go:reboot:")])
 
 # Действия с подтверждением: kind -> arg -> (что сделать, предупреждение, куда вернуться)
@@ -93,21 +92,22 @@ class Handlers:
         except Exception as e:  # раздел не открылся — показываем ошибку, а не вечное «⏳»
             log.exception("render %s failed", view)
             return (f"🔴 Не удалось открыть раздел: {esc(type(e).__name__)}: {esc(str(e)[:300])}",
-                    kb([("⟳ Повторить", f"v:{view}"), ("◀ Управление", "v:ctl")]))
+                    kb([("⟳ Повторить", f"v:{view}"), ("◀ Сервер", "v:status")]))
         return (text if view in ("ctl",) else stamp(text)), markup
 
     async def _render(self, view: str) -> tuple[str, dict | None]:
         if view == "status":
-            return await views.status(self.state.data.get("geo_last")), refresh_kb(view)
+            return await views.status(), kb([("⟳ Обновить", "v:status")],
+                                            [("🔧 Службы и журналы", "v:svc"), ("🛡 Баны", "v:bans")])
         if view == "tun":
             text = await views.tunnel_view(pool=self.bot.pool, emojis=self.state.data.get("tunnel_emoji"))
             return text, refresh_kb(view)
         if view == "geo":
-            return await views.geo_view(self.bot.pool), refresh_kb(view)
+            return await views.geo_view(self.bot.pool, self.state.data), refresh_kb(view)
         if view == "bans":
             text, banned = await views.bans()
             rows = [[(f"Разбанить {ip}", d)] for jail, ip in banned if len((d := f"ub:{jail}:{ip}").encode()) <= 64]
-            return text, kb(*rows, [("⟳ Обновить", "v:bans")])
+            return text, kb(*rows, [("⟳ Обновить", "v:bans"), ("◀ Сервер", "v:status")])
         if view == "report":
             return (await report.build(self.state))[0], refresh_kb(view)
         if view == "ctl":
@@ -175,7 +175,7 @@ class Handlers:
         except CmdError as e:
             lines.append(f"🔴 docker: {esc(e)}")
         lines.append("<i>🔄 — перезапуск (с подтверждением), 📜 — последние строки журнала</i>")
-        return "\n".join(lines), kb(*rows, [("◀ Управление", "v:ctl")])
+        return "\n".join(lines), kb(*rows, [("◀ Сервер", "v:status")])
 
     async def logs_view(self, what: str, name: str) -> tuple[str, dict]:
         try:

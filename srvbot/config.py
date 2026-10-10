@@ -80,6 +80,8 @@ TUNNEL_MATCH = _list(_env.get("TUNNEL_MATCH", ""))      # подстроки и�
 TUNNEL_TOOLS = _list(_env.get("TUNNEL_TOOLS", ""))      # утилиты внутри контейнера, первая найденная
 TUNNEL_CLIENTS = _list(_env.get("TUNNEL_CLIENTS", ""))  # пути/шаблоны к JSON со списком клиентов
 TUNNEL_ONLINE_SEC = 180      # рукопожатие свежее N секунд — клиент в сети
+TUNNEL_STALL_CHECKS = 3      # пакеты от клиента приходят, а рукопожатия нет N проверок подряд — алерт
+TRAFFIC_DAY_GB = 20          # предупредить, если клиенты за сегодня прокачали больше N ГБ
 
 # Доступность из выбранной страны через check-host.net (код страны в env, пусто — выключено)
 GEO_COUNTRY = _env.get("CHECK_COUNTRY", "").lower()

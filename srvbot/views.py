@@ -3,7 +3,9 @@ import asyncio
 import re
 import time
 
-from . import checkhost, config, docker, geoip, system, tunnel
+from datetime import datetime
+
+from . import checkhost, config, docker, geoip, manage, report, system, tunnel
 from .util import IND, CmdError, esc, fmt_ago, fmt_bytes, fmt_duration
 
 
@@ -11,17 +13,31 @@ def _bar(pct: float) -> str:
     return "🔴" if pct >= 90 else "🟡" if pct >= 75 else "🟢"
 
 
-async def status(geo: dict | None = None) -> str:
+def unit_icon(state: str) -> str:
+    return "🟢" if state == "active" else "🟡" if state in ("activating", "reloading") else "🔴"
+
+
+async def status() -> str:
     m = system.metrics(await system.cpu_now())
-    lines = ["<b>📊 Статус сервера</b>",
+    lines = ["<b>📊 Сервер</b>",
              f"⏱ аптайм {fmt_duration(m.uptime)}, load {m.load[0]:.2f} / {m.load[1]:.2f} / {m.load[2]:.2f}",
              f"{_bar(m.cpu_pct)} CPU {m.cpu_pct:.0f}%",
              f"{_bar(100 - m.mem_avail_pct)} RAM доступно {fmt_bytes(m.mem_avail)} из {fmt_bytes(m.mem_total)}"
              + (f", swap {fmt_bytes(m.swap_used)}/{fmt_bytes(m.swap_total)}" if m.swap_total else ""),
              f"{_bar(m.disk_pct)} диск {m.disk_pct:.0f}%, свободно {fmt_bytes(m.disk_free)}",
-             f"🌐 IP {esc(', '.join(system.public_ipv4()) or 'нет внешнего IPv4')}",
-             geo_line(geo)]
-    lines = [line for line in lines if line]  # проверка страны может быть выключена
+             f"🌐 IP {esc(', '.join(system.public_ipv4()) or 'нет внешнего IPv4')}"]
+    # каждая внешняя команда в своём try: зависшая одна не должна ронять весь раздел
+    try:
+        states = await manage.unit_states()
+        lines.append("🔧 " + " · ".join(f"{unit_icon(states.get(u, '?'))} {u}" for u in manage.SERVICES))
+    except CmdError as e:
+        lines.append(f"🔴 службы: {esc(e)}")
+    jails = await system.jails()
+    lines.append("🛡 fail2ban: " + (" · ".join(f"{esc(j.name)} сейчас {len(j.banned_now)}" for j in jails)
+                                    if jails else "не отвечает"))
+    upd, sec = system.updates()
+    if upd:
+        lines.append(f"📦 обновлений: {upd}" + (f" (безопасности {sec})" if sec else ""))
     lines.append("\n<b>🐳 Контейнеры</b>")
     try:
         ctrs = await docker.containers()
@@ -52,8 +68,7 @@ async def status(geo: dict | None = None) -> str:
     return "\n".join(lines)
 
 
-def is_online(p: tunnel.Peer, now: float) -> bool:
-    return bool(p.handshake) and now - p.handshake < config.TUNNEL_ONLINE_SEC
+is_online = tunnel.is_online
 
 
 NAME_MAX = 12   # длиннее — обрезаем, чтобы строка влезала в экран телефона
@@ -97,21 +112,6 @@ async def _geo_all(pool, peers: list[tunnel.Peer]) -> dict[str, dict]:
     return {ip: r for ip, r in zip(ips, res) if isinstance(r, dict)}
 
 
-def geo_line(geo: dict | None) -> str:
-    """Строка статуса о доступности из страны CHECK_COUNTRY (если проверка включена)."""
-    if not config.GEO_COUNTRY:
-        return ""
-    flag = checkhost.flag(config.GEO_COUNTRY)
-    if not geo or geo.get("cc") != config.GEO_COUNTRY:
-        return f"{flag} доступность: ещё не проверялась"
-    ago = fmt_ago(geo["ts"])
-    if geo["fail"] and geo["ctl_ok"]:
-        return f"🔴 {flag} недоступен с {geo['fail']}/{geo['total']} узлов ({esc(', '.join(geo['failed']))}; {ago})"
-    if geo["ok"] and not geo["fail"]:
-        return f"{flag} доступен ({geo['ok']}/{geo['total']} узлов, {ago})"
-    return f"🟡 {flag}: нет данных — узлы check-host не ответили ({ago})"
-
-
 def ssh_target() -> str | None:
     """IP:порт для проверки извне — внешний IPv4 и порт sshd (порт открыт всегда)."""
     ips = system.public_ipv4()
@@ -124,19 +124,58 @@ def ssh_target() -> str | None:
 GEO_WAIT = "⏳ Проверяю доступность сервера с ~60 узлов check-host.net по всему миру, это до 40 секунд…"
 
 
-async def geo_view(pool) -> str:
+def risk_card(state: dict, insts: list[tunnel.Instance] | None = None) -> str:
+    """Сводка признаков риска блокировки адреса — из состояния бота, без сетевых запросов."""
+    now = time.time()
+    lines = ["<b>🧭 Риск блокировки</b>"]
+    if since := state.get("ip_since"):
+        lines.append(f"🌐 адрес не менялся {fmt_duration(now - since)} (с {datetime.fromtimestamp(since, config.TZ):%d.%m})")
+    if config.GEO_COUNTRY:
+        flag = checkhost.flag(config.GEO_COUNTRY)
+        geo = state.get("geo_last")
+        hist = [h for h in state.get("geo_hist", []) if now - h[0] < 86400]
+        if geo and geo.get("cc") == config.GEO_COUNTRY:
+            mark = "❌" if geo["fail"] else ("✅" if geo["ok"] else "⚪")
+            line = f"{flag} последняя проверка {fmt_ago(geo['ts'], now)}: {mark} {geo['ok']}/{geo['total']} узлов"
+            if geo["fail"]:
+                line += f" ({esc(', '.join(geo['failed']))})"
+            if hist:
+                bad = sum(1 for h in hist if h[2])
+                line += f" · за сутки проверок {len(hist)}, неудачных {bad}"
+            lines.append(line)
+        else:
+            lines.append(f"{flag} доступность ещё не проверялась")
+    day = state.get("traffic_day") or {}
+    if insts and day.get("date"):
+        _, rx, tx = report.day_traffic(day, insts, day["date"])
+        now_online = sum(is_online(p, now) for i in insts if not i.error for p in i.peers)
+        total = sum(len(i.peers) for i in insts if not i.error)
+        lines.append(f"📈 трафик за сегодня ↓{fmt_bytes(tx)} ↑{fmt_bytes(rx)} · в сети {now_online}/{total}")
+    return "\n".join(lines)
+
+
+async def geo_view(pool, state: dict | None = None) -> str:
     target = ssh_target()
     if not target:
         return "<b>🌍 Доступность</b>\n🔴 у сервера нет внешнего IPv4"
+    card = ""
+    if state is not None:
+        insts = None
+        if tunnel.found():
+            try:
+                insts = await tunnel.collect()
+            except CmdError:
+                pass
+        card = risk_card(state, insts) + "\n\n"
     started = time.monotonic()
     try:
         info = await asyncio.get_running_loop().run_in_executor(pool, checkhost.node_info)
         res = await checkhost.check(pool, target, sorted(info))
     except checkhost.CheckHostError as e:
-        return f"<b>🌍 Доступность</b>\n🔴 check-host.net не ответил: {esc(e)}"
+        return f"{card}<b>🌍 Доступность</b>\n🔴 check-host.net не ответил: {esc(e)}"
     countries = checkhost.by_country(res, info, first=config.GEO_COUNTRY)
     n_ok = sum(v is True for v in res.values())
-    lines = [f"<b>🌍 Доступность {esc(target)}</b>", ""]
+    lines = [f"{card}<b>🌍 Доступность {esc(target)}</b>", ""]
     for c in countries:
         if c.cc != config.GEO_COUNTRY:
             continue
