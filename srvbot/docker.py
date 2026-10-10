@@ -1,4 +1,5 @@
 import json
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -31,9 +32,19 @@ class Container:
             return 0
 
 
+_last: tuple[float, list[Container]] | None = None   # последний удачный опрос: (когда, контейнеры)
+
+
+def cached() -> tuple[float, list[Container]] | None:
+    """Что docker отвечал в прошлый раз — чтобы показать хоть что-то, пока он не отвечает."""
+    return _last
+
+
 async def containers() -> list[Container]:
+    global _last
     ids = (await run("docker", "ps", "-aq")).split()
     if not ids:
+        _last = (time.time(), [])
         return []
     data = json.loads(await run("docker", "inspect", *ids))
     res = []
@@ -47,7 +58,9 @@ async def containers() -> list[Container]:
             started_at=c.get("State", {}).get("StartedAt", ""),
             ports=sorted(ports),
         ))
-    return sorted(res, key=lambda c: c.name)
+    res.sort(key=lambda c: c.name)
+    _last = (time.time(), res)
+    return res
 
 
 async def restart(name: str) -> None:

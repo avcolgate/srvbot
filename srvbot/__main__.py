@@ -2,12 +2,27 @@ import asyncio
 import logging
 import os
 import signal
+import time
+
+import psutil
 
 from . import config, tunnel
 from .alerts import Alerts
 from .handlers import Handlers, bot_commands, main_kb
 from .tg import Bot, TGError
-from .util import State
+from .util import State, fmt_duration
+
+
+def start_text(state: State) -> str:
+    """С чем бот запустился: после перезагрузки сервера (с длительностью простоя), после сбоя или штатно."""
+    boot = psutil.boot_time()
+    if time.time() - boot < 300:
+        last_seen = state.data.get("last_seen") or 0
+        gap = f" (не работал {fmt_duration(boot - last_seen)})" if 0 < last_seen < boot else ""
+        return f"🔁 сервер перезагрузился{gap}, бот мониторинга запущен"
+    if state.data.get("clean_exit") is False:
+        return "⚠️ бот мониторинга перезапущен после сбоя"
+    return "🤖 бот мониторинга запущен"
 
 
 async def main():
@@ -16,7 +31,7 @@ async def main():
         raise SystemExit(f"BOT_TOKEN/OWNER_ID не заданы в {config.ENV_FILE}")
     bot = Bot(config.BOT_TOKEN)
     state = State()
-    crashed = state.data.get("clean_exit") is False
+    text = start_text(state)
     state["clean_exit"] = False
     state.save()
     alerts = Alerts(bot, state)
@@ -29,8 +44,7 @@ async def main():
         try:
             await bot.call("setMyCommands", scope={"type": "chat", "chat_id": config.OWNER_ID},
                            commands=[{"command": c, "description": d} for c, d in bot_commands()])
-            await bot.send(config.OWNER_ID, "⚠️ бот мониторинга перезапущен после сбоя" if crashed
-                           else "🤖 бот мониторинга запущен", main_kb())
+            await bot.send(config.OWNER_ID, text, main_kb())
             break
         except TGError as e:
             logging.warning("старт: %s, повтор через %d с", e, delay)

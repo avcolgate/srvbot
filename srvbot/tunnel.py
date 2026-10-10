@@ -282,7 +282,7 @@ async def collect() -> list[Instance]:
         globs = config.TUNNEL_CLIENTS or tuple(filter(None, [_known.get(c.name, "")]))
         script = _PROBE.format(tools=" ".join(config.TUNNEL_TOOLS), globs=" ".join(globs))
         try:
-            parse_probe(await run("docker", "exec", c.name, "sh", "-c", script, timeout=20), inst)
+            parse_probe(await run("docker", "exec", c.name, "sh", "-c", script), inst)
         except (CmdError, TunnelError) as e:
             if not explicit and c.name not in _known:
                 _not_tunnel[c.name] = c.started_at  # не туннель (или нет даже sh) — до перезапуска не трогаем

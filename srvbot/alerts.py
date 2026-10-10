@@ -29,6 +29,7 @@ class Alerts:
         self.known_ctr: list[str] = state.get("containers", [])     # контейнеры, которые должны работать
         self.known_ports: dict[str, str] = state.get("ports", {})   # "tcp/443" -> процесс
         self.streak: dict[str, int] = {}
+        self.ctrs: dict[str, docker.Container] | None = None   # контейнеры по последней проверке; None — docker не ответил
         self.cpu = system.CpuMeter()
         self.name_wait: dict[str, int] = {}  # новые клиенты без имени: сколько проверок уже ждём
 
@@ -80,9 +81,11 @@ class Alerts:
         try:
             ctrs = {c.name: c for c in await docker.containers()}
         except CmdError as e:
+            self.ctrs = None
             await self.set("docker", True, "docker", str(e), sustain=2,
                            markup=buttons(("🔄 Перезапустить docker", "ga:unit:docker"), ("📜 Журнал", "la:u:docker")))
             return
+        self.ctrs = ctrs
         await self.set("docker", False, "docker")
         for c in ctrs.values():
             if c.watched and c.name not in self.known_ctr:
@@ -121,10 +124,28 @@ class Alerts:
                 self.known_ports[p] = proc
                 self.state.save()
         for p, proc in list(self.known_ports.items()):
+            if p not in cur and proc == "docker-proxy" and self._unpublished(p):
+                # контейнер пересоздали с другим портом (docker жив, все контейнеры работают) — это не поломка
+                self.forget("port", p)
+                await self.send(f"ℹ️ порт {esc(p)} больше не публикуется контейнерами — перестал за ним следить")
+                continue
             problem = (f"привязан к адресу {stale[p]}, которого больше нет на сервере" if p in stale
                        else "больше не слушается") + ". Если так и задумано — нажмите «Забыть»"
             await self.set(f"port:{p}", p not in cur, f"порт {p} ({proc})", problem,
                            sustain=config.PORT_MISS_CHECKS, markup=forget_kb("port", p, ("🔧 Службы", "nv:svc")))
+
+    def _unpublished(self, port: str) -> bool:
+        """Порт «udp/443» снят с публикации намеренно: docker ответил, ни один отслеживаемый контейнер
+        не лежит и не исчез, и никто этот порт не публикует."""
+        if self.ctrs is None or any(n not in self.ctrs or not self.ctrs[n].running for n in self.known_ctr):
+            return False
+        proto, _, num = port.partition("/")
+        return all(f"{num}/{proto}" not in c.ports for c in self.ctrs.values())
+
+    async def check_certs(self):
+        for c in await system.certs():
+            await self.set(f"cert:{c.name}", c.days_left < config.CERT_WARN_DAYS, f"сертификат {c.name}",
+                           f"истекает через {c.days_left} дн.")
 
     async def check_units(self):
         failed = set(await system.failed_units())
@@ -245,37 +266,17 @@ class Alerts:
 
     # --- расписание ---
 
-    async def daily(self) -> bool:
-        """Ежедневная сводка; True — отправлена (или отправлять нечего)."""
-        lines = []
-        for c in await system.certs():
-            if c.days_left < config.CERT_WARN_DAYS:
-                lines.append(f"🔒 сертификат {esc(c.name)} истекает через {c.days_left} дн.")
-        prev = self.state.get("f2b_daily", {})
-        jails = await system.jails()
-        bans = [(j.name, report.delta(j.total_banned, prev.get(j.name))) for j in jails]
-        if any(n for _, n in bans):
-            lines.append("🛡 баны fail2ban за сутки: " + ", ".join(f"{esc(j)} +{n}" for j, n in bans))
-        if lines and not await self.send("<b>☀️ Ежедневная сводка</b>\n" + "\n".join(lines)):
-            return False
-        self.state["f2b_daily"] = {j.name: j.total_banned for j in jails}
-        return True
-
     async def scheduled(self):
         now = datetime.now(config.TZ)
-        today, week = now.date().isoformat(), "%d-W%02d" % now.isocalendar()[:2]
-        if "last_daily" not in self.state.data:  # первый запуск — только базовые снимки, без рассылки
-            self.state["last_daily"], self.state["last_weekly"] = today, week
-            self.state["f2b_daily"] = {j.name: j.total_banned for j in await system.jails()}
+        week = "%d-W%02d" % now.isocalendar()[:2]
+        if "last_weekly" not in self.state.data:  # первый запуск — только базовый снимок, без рассылки
+            self.state["last_weekly"] = week
             self.state["snap"] = (await report.build(self.state))[1]
             self.state.save()
             return
-        if now.hour < config.DAILY_HOUR:
+        if now.hour < config.REPORT_HOUR:
             return
         # Отметку «отправлено» ставим только после успешной отправки: сбой — повторим через минуту
-        if self.state["last_daily"] != today and await self.daily():
-            self.state["last_daily"] = today
-            self.state.save()
         if now.weekday() >= config.WEEKLY_WEEKDAY and self.state["last_weekly"] != week:
             text, snap = await report.build(self.state)
             if await self.send(text):
@@ -288,11 +289,14 @@ class Alerts:
             started = time.monotonic()
             for name, fn in (("containers", self.check_containers), ("resources", self.check_resources),
                              ("ip", self.check_ip), ("ports", self.check_ports), ("units", self.check_units),
-                             ("upgrade", self.check_upgrade), ("scheduled", self.scheduled)):
+                             ("certs", self.check_certs), ("upgrade", self.check_upgrade),
+                             ("scheduled", self.scheduled)):
                 try:
                     await fn()
                 except Exception:
                     log.exception("check %s failed", name)
+            self.state["last_seen"] = time.time()  # по этой отметке при старте считаем, сколько сервер лежал
+            self.state.save()
             try:
                 await self.check_tunnel()
             except Exception:

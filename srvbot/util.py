@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import html
 import json
 import os
@@ -12,18 +13,23 @@ class CmdError(Exception):
     pass
 
 
-# Не больше двух внешних команд одновременно: docker/fail2ban-client занимают по 20–30 МБ,
-# и параллельные вызовы складываются в пики памяти.
+# Не больше двух фоновых внешних команд одновременно: docker/fail2ban-client занимают по 20–30 МБ,
+# и параллельные вызовы складываются в пики памяти. У команд из чата свой слот и короткий таймаут,
+# чтобы ответ не ждал зависшие фоновые проверки, когда сервер перегружен.
 _cmd_slots = asyncio.Semaphore(2)
+_ui_slot = asyncio.Semaphore(1)
+INTERACTIVE = contextvars.ContextVar("interactive", default=False)  # True внутри обработки апдейта
 
 
 async def run(*args: str, **kw) -> str:
-    async with _cmd_slots:
+    async with (_ui_slot if INTERACTIVE.get() else _cmd_slots):
         return await _run(*args, **kw)
 
 
-async def _run(*args: str, timeout: float = 30, check: bool = True, merge: bool = False) -> str:
+async def _run(*args: str, timeout: float | None = None, check: bool = True, merge: bool = False) -> str:
     """Запускает команду без shell, возвращает stdout (merge=True — вместе с stderr)."""
+    if timeout is None:
+        timeout = config.UI_CMD_TIMEOUT if INTERACTIVE.get() else config.CMD_TIMEOUT
     try:
         proc = await asyncio.create_subprocess_exec(
             *args, stdout=asyncio.subprocess.PIPE,

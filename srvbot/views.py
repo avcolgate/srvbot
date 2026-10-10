@@ -24,11 +24,16 @@ async def status(geo: dict | None = None) -> str:
     lines = [line for line in lines if line]  # проверка страны может быть выключена
     lines.append("\n<b>🐳 Контейнеры</b>")
     try:
-        for c in await docker.containers():
-            icon = "🟢" if c.running else ("🔴" if c.watched else "⚪")
-            lines.append(f"{icon} {esc(c.name)} — {esc(c.status)}")
-    except CmdError as e:
-        lines.append(f"🔴 docker: {esc(e)}")
+        ctrs = await docker.containers()
+    except CmdError as e:  # docker завис (например, сервер перегружен) — показываем, что знали до этого
+        lines.append(f"🔴 docker не отвечает: {esc(e)}")
+        ctrs = []
+        if last := docker.cached():
+            lines.append(f"<i>по данным {fmt_ago(last[0])}:</i>")
+            ctrs = last[1]
+    for c in ctrs:
+        icon = "🟢" if c.running else ("🔴" if c.watched else "⚪")
+        lines.append(f"{icon} {esc(c.name)} — {esc(c.status)}")
     ports, stale = system.listening()
     if ports:
         lines.append("\n<b>🔌 Порты</b>")
@@ -159,7 +164,10 @@ async def geo_view(pool) -> str:
 
 async def tunnel_view(insts: list[tunnel.Instance] | None = None, pool=None, emojis: dict | None = None) -> str:
     if insts is None:
-        insts = await tunnel.collect()
+        try:
+            insts = await tunnel.collect()
+        except CmdError as e:  # docker завис — честно скажем, а не «не удалось открыть раздел»
+            return f"<b>🔐 Клиенты</b>\n🔴 docker не отвечает: {esc(e)}"
     if not insts:
         return ("<b>🔐 Клиенты</b>\nтуннель на сервере не найден: нет docker-контейнера "
                 "с подходящей утилитой (см. README, раздел про настройки)")

@@ -51,6 +51,10 @@ BOT_TOKEN = _env.get("BOT_TOKEN", "")
 OWNER_ID = int(_env.get("OWNER_ID", "0") or 0)
 TZ = _tz(_env.get("TIMEZONE", ""))
 
+# Внешние команды (docker, fail2ban-client, systemctl…)
+CMD_TIMEOUT = 30             # сек для фоновых проверок
+UI_CMD_TIMEOUT = 10          # сек для команд из чата: лучше быстро ответить «не отвечает», чем молчать
+
 # Цикл алертов
 CHECK_INTERVAL = 60          # сек
 DISK_PCT = 90                # алерт при заполнении / >= N%
@@ -62,8 +66,8 @@ PORT_MISS_CHECKS = 2         # сколько проверок подряд по
 # Процессы, чьи слушающие порты бот запоминает и контролирует (+ PORT_PROCESSES из env)
 PORT_PROCESSES = {"nginx", "docker-proxy", "sshd"} | set(_list(_env.get("PORT_PROCESSES", "")))
 
-# Ежедневные / еженедельные задачи (время по TZ)
-DAILY_HOUR = 10
+# Недельный отчёт (время по TZ)
+REPORT_HOUR = 10
 WEEKLY_WEEKDAY = 0           # понедельник
 CERT_WARN_DAYS = 14
 

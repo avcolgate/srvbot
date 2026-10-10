@@ -10,7 +10,7 @@ from datetime import datetime
 from . import config, docker, manage, report, system, tunnel, views
 from .alerts import Alerts
 from .tg import Bot, kb, reply_kb
-from .util import CmdError, State, cut_html, esc, fmt_ago, fmt_bytes
+from .util import INTERACTIVE, CmdError, State, cut_html, esc, fmt_ago, fmt_bytes
 
 log = logging.getLogger(__name__)
 
@@ -72,6 +72,7 @@ class Handlers:
         self.pending: dict[str, list] = {}
 
     async def __call__(self, update: dict):
+        INTERACTIVE.set(True)  # свой слот и короткий таймаут для внешних команд (см. util.run)
         # Только владелец и только в личном чате: в группе ответы увидели бы все участники
         if msg := update.get("message"):
             if msg.get("from", {}).get("id") == config.OWNER_ID and msg.get("chat", {}).get("id") == config.OWNER_ID \
