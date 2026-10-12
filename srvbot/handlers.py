@@ -10,7 +10,7 @@ from datetime import datetime
 from . import config, docker, manage, report, system, tunnel, views
 from .alerts import Alerts
 from .tg import Bot, kb, reply_kb
-from .util import INTERACTIVE, CmdError, State, cut_html, esc, fmt_ago, fmt_bytes
+from .util import INTERACTIVE, RICH_LEN, CmdError, State, cut_html, esc, fmt_ago, fmt_bytes, p, tg_time
 
 log = logging.getLogger(__name__)
 
@@ -39,15 +39,17 @@ CTL_KB = kb([("📦 Обновления", "v:upd"), ("🧹 Очистка ди�
 # Действия с подтверждением: kind -> arg -> (что сделать, предупреждение, куда вернуться)
 ACTIONS = {
     "reboot": lambda a: ("перезагрузить сервер", "сервер и бот будут недоступны примерно минуту", "ctl"),
-    "restart": lambda a: (f"перезапустить контейнер {a}", "его клиенты отключатся на несколько секунд", "svc"),
-    "unit": lambda a: (f"перезапустить службу {a}", manage.RESTART_WARN.get(a, ""), "svc"),
-    "svc": lambda a: (f"перезапустить службу {a}", manage.RESTART_WARN.get(a.removesuffix(".service"), ""), "svc"),
+    "restart": lambda a: (f"перезапустить контейнер {a}", "его клиенты отключатся на несколько секунд", "status"),
+    "unit": lambda a: (f"перезапустить службу {a}", manage.RESTART_WARN.get(a, ""), "status"),
+    "svc": lambda a: (f"перезапустить службу {a}", manage.RESTART_WARN.get(a.removesuffix(".service"), ""), "status"),
     "upgrade": lambda a: ("установить обновления", "", "upd"),
     "clean": lambda a: ("очистить диск", "", "clean"),
 }
 
 # Долгие разделы: сначала показываем «⏳», потом подменяем результатом
 SLOW = {"geo": views.GEO_WAIT}
+# Разделы в rich-формате (заголовки, таблицы, сворачиваемые блоки); остальное — обычные сообщения
+RICH = {"status", "tun", "geo", "bans", "report"}
 MAX_LEN = 4000
 
 
@@ -55,13 +57,14 @@ def refresh_kb(view: str) -> dict:
     return kb([("⟳ Обновить", f"v:{view}")])
 
 
-def stamp(text: str) -> str:
+def stamp(text: str, rich: bool = False) -> str:
     """Подпись со временем: видно, насколько свежие данные после «⟳ Обновить»."""
-    return f"{text}\n\n<i>🕒 обновлено {datetime.now(config.TZ):%H:%M:%S}</i>"
+    t = f"🕒 обновлено {tg_time(time.time(), 'T')}"
+    return f"{text}<footer>{t}</footer>" if rich else f"{text}\n\n<i>{t}</i>"
 
 
-def cut(text: str) -> str:
-    return cut_html(text, MAX_LEN)
+def cut(text: str, rich: bool = False) -> str:
+    return cut_html(text, RICH_LEN if rich else MAX_LEN, rich)
 
 
 class Handlers:
@@ -91,23 +94,20 @@ class Handlers:
             text, markup = await self._render(view)
         except Exception as e:  # раздел не открылся — показываем ошибку, а не вечное «⏳»
             log.exception("render %s failed", view)
-            return (f"🔴 Не удалось открыть раздел: {esc(type(e).__name__)}: {esc(str(e)[:300])}",
-                    kb([("⟳ Повторить", f"v:{view}"), ("◀ Сервер", "v:status")]))
-        return (text if view in ("ctl",) else stamp(text)), markup
+            err = f"🔴 Не удалось открыть раздел: {esc(type(e).__name__)}: {esc(str(e)[:300])}"
+            return (p(err) if view in RICH else err), kb([("⟳ Повторить", f"v:{view}"), ("◀ Сервер", "v:status")])
+        return (text if view in ("ctl",) else stamp(text, view in RICH)), markup
 
     async def _render(self, view: str) -> tuple[str, dict | None]:
         if view == "status":
-            return await views.status(), kb([("⟳ Обновить", "v:status")],
-                                            [("🔧 Службы и журналы", "v:svc"), ("🛡 Баны", "v:bans")])
+            return await views.status(), kb([("⟳ Обновить", "v:status"), ("🛡 Баны", "v:bans")])
         if view == "tun":
             text = await views.tunnel_view(pool=self.bot.pool, emojis=self.state.data.get("tunnel_emoji"))
             return text, refresh_kb(view)
         if view == "geo":
             return await views.geo_view(self.bot.pool, self.state.data), refresh_kb(view)
         if view == "bans":
-            text, banned = await views.bans()
-            rows = [[(f"Разбанить {ip}", d)] for jail, ip in banned if len((d := f"ub:{jail}:{ip}").encode()) <= 64]
-            return text, kb(*rows, [("⟳ Обновить", "v:bans"), ("◀ Сервер", "v:status")])
+            return await views.bans(), kb([("⟳ Обновить", "v:bans"), ("◀ Сервер", "v:status")])
         if view == "report":
             return (await report.build(self.state))[0], refresh_kb(view)
         if view == "ctl":
@@ -116,8 +116,6 @@ class Handlers:
             return await self.updates_view()
         if view == "clean":
             return await self.clean_view()
-        if view == "svc":
-            return await self.services_view()
         raise ValueError(view)
 
     async def updates_view(self) -> tuple[str, dict]:
@@ -154,29 +152,6 @@ class Handlers:
         lines.append(f"\n<i>всего ~{fmt_bytes(sum(est.values()))}; данные контейнеров и настройки не трогаются</i>")
         return "\n".join(lines), kb([("🧹 Очистить", "go:clean:")], [("◀ Управление", "v:ctl")])
 
-    async def services_view(self) -> tuple[str, dict]:
-        icon = lambda st: "🟢" if st == "active" else "🟡" if st in ("activating", "reloading") else "🔴"
-        states = await manage.unit_states()
-        lines = ["<b>🔧 Службы и журналы</b>",
-                 " · ".join(f"{icon(states.get(u, '?'))} {u}" for u in manage.SERVICES)]
-        rows = []
-        for u in manage.SERVICES:
-            row = [(f"🔄 {u}", f"go:unit:{u}")] if u in manage.RESTARTABLE else []
-            rows.append(row + [(f"📜 {u}", f"lg:u:{u}")])
-        try:
-            ctrs = [c for c in await docker.containers() if c.watched]
-            if ctrs:
-                lines.append("🐳 " + " · ".join(f"{icon('active' if c.running else c.status)} {esc(c.name)}" for c in ctrs))
-            for c in ctrs:
-                row = [(f"🔄 {c.name}", f"go:restart:{c.name}"), (f"📜 {c.name}", f"lg:c:{c.name}")]
-                row = [(t, d) for t, d in row if len(d.encode()) <= 64]  # лимит callback_data в Telegram
-                if row:
-                    rows.append(row)
-        except CmdError as e:
-            lines.append(f"🔴 docker: {esc(e)}")
-        lines.append("<i>🔄 — перезапуск (с подтверждением), 📜 — последние строки журнала</i>")
-        return "\n".join(lines), kb(*rows, [("◀ Сервер", "v:status")])
-
     async def logs_view(self, what: str, name: str) -> tuple[str, dict]:
         try:
             out = await (manage.unit_logs(name) if what == "u" else manage.container_logs(name))
@@ -193,7 +168,7 @@ class Handlers:
             kept.append(line)
             size += len(line) + 1
         text = f"<b>📜 {esc(name)}</b> — последние строки\n<pre>" + "\n".join(reversed(kept)) + "</pre>"
-        return stamp(text), kb([("⟳ Обновить", f"lg:{what}:{name}"), ("◀ Службы", "v:svc")])
+        return stamp(text), kb([("⟳ Обновить", f"lg:{what}:{name}"), ("◀ Сервер", "v:status")])
 
     def ask(self, kind: str, arg: str) -> str:
         """Регистрирует действие, ждущее подтверждения; токен живёт CONFIRM_TTL секунд."""
@@ -222,14 +197,15 @@ class Handlers:
         алерты и уведомления остаются."""
         if request_id:
             await self.bot.delete(chat, request_id)
+        rich = view in RICH
         if view in SLOW:
             sent = await self.bot.send(chat, SLOW[view])
             await self.replace_view(chat, sent["message_id"])
             text, markup = await self.render(view)
-            await self.bot.edit(chat, sent["message_id"], cut(text), markup)
+            await self.bot.edit(chat, sent["message_id"], cut(text, rich), markup, rich=rich)
             return
         text, markup = await self.render(view)
-        sent = await self.bot.send(chat, cut(text), markup)
+        sent = await self.bot.send(chat, cut(text, rich), markup, rich=rich)
         await self.replace_view(chat, sent["message_id"])
 
     async def replace_view(self, chat: int, new_id: int):
@@ -249,7 +225,8 @@ class Handlers:
             if arg in SLOW:
                 await self.bot.edit(chat, mid, SLOW[arg])
             text, markup = await self.render(arg)
-            await self.bot.edit(chat, mid, cut(text), markup)
+            rich = arg in RICH
+            await self.bot.edit(chat, mid, cut(text, rich), markup, rich=rich)
         elif kind == "go":
             await self.on_ask(cq, chat, mid, *arg.partition(":")[::2])
         # Кнопки под алертами: результат — новым сообщением, сам алерт остаётся в чате
@@ -289,7 +266,8 @@ class Handlers:
             try:
                 await system.unban(jail, ip)
                 await self.bot.answer(cq["id"], f"{ip} разбанен", alert=True)
-                await self.bot.drop_markup(chat, mid)
+                text, markup = await self.render("bans")  # кнопка «Разбанить» у адреса должна исчезнуть
+                await self.bot.edit(chat, mid, cut(text, True), markup, rich=True)
                 await self.bot.send(chat, f"✅ {esc(ip)} разбанен в {esc(jail)}")
             except CmdError as e:
                 await self.bot.answer(cq["id"], f"Ошибка: {e}"[:200], alert=True)
@@ -313,7 +291,8 @@ class Handlers:
         text = f"❓ Точно {esc(desc)}?" + (f"\n⚠️ {esc(warn)}" if warn else "")
         text += f"\n<i>подтверждение действует {config.CONFIRM_TTL} с</i>"
         cancel = "x:" if new_msg else f"v:{back}"
-        markup = kb([("✅ Да, выполнить", f"do:{tok}"), ("✖ Отмена", cancel)])
+        style = "danger" if kind in ("reboot", "restart", "unit", "svc") else "success"  # красная — для обрывов связи
+        markup = kb([("✅ Да, выполнить", f"do:{tok}", style), ("✖ Отмена", cancel)])
         if new_msg:
             await self.bot.send(chat, text, markup)
         else:

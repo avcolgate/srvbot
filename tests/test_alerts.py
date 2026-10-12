@@ -3,6 +3,7 @@ import unittest
 from unittest import mock
 
 from srvbot import docker, handlers, tunnel
+from srvbot.util import cut_html
 from srvbot.__main__ import start_text
 from srvbot.alerts import Alerts
 
@@ -95,6 +96,20 @@ class MainKeyboard(unittest.TestCase):
 
     def test_bans_stays_a_command(self):
         self.assertEqual(handlers.COMMANDS["bans"], "bans")
+
+
+class CutRich(unittest.TestCase):
+    def test_closes_block_tags(self):
+        text = "<h3>Заголовок</h3><table><tr><td>" + "x" * 50 + "</td></tr>" + "<tr><td>y</td></tr>" * 200 + "</table>"
+        cut = cut_html(text, 300, rich=True)
+        self.assertTrue(len(cut) < 400)
+        self.assertTrue(cut.endswith("</table><p>…</p>"), cut[-60:])
+
+    def test_closes_inline_rich_tags(self):
+        text = "<p>" + "<mark>🔴 x <tg-button type=\"callback_data\" data=\"x:\">🔄</tg-button></mark><br/>" * 60 + "</p>"
+        cut = cut_html(text, 200, rich=True)
+        self.assertNotIn("<tg-button", cut[cut.rfind("</tg-button>") + 1:])
+        self.assertTrue(cut.endswith("</p><p>…</p>"), cut[-60:])
 
 
 if __name__ == "__main__":

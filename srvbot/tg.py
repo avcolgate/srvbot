@@ -62,9 +62,11 @@ def api_call(token: str, method: str, params: dict, timeout: float = 30):
         raise TGError(f"{method}: {data.get('description', resp.status)}")
 
 
-def kb(*rows: list[tuple[str, str]]) -> dict:
-    """Inline-клавиатура: kb([("Текст", "callback"), ...], ...)."""
-    return {"inline_keyboard": [[{"text": t, "callback_data": d} for t, d in row] for row in rows]}
+def kb(*rows: list[tuple]) -> dict:
+    """Inline-клавиатура: kb([("Текст", "callback"), ("Текст", "callback", "danger"), ...], ...).
+    Третий элемент — стиль кнопки: danger (красная), success (зелёная), primary (синяя)."""
+    return {"inline_keyboard": [[{"text": b[0], "callback_data": b[1], **({"style": b[2]} if len(b) > 2 else {})}
+                                 for b in row] for row in rows]}
 
 
 def reply_kb(*rows: list[str]) -> dict:
@@ -84,16 +86,29 @@ class Bot:
         return await asyncio.get_running_loop().run_in_executor(
             self.pool, api_call, self.token, method, params, _timeout)
 
-    async def send(self, chat_id: int, text: str, markup: dict | None = None, reply_to: int | None = None):
+    @staticmethod
+    def _rich(text: str) -> dict:
+        # Rich-сообщение (Bot API 10.1+): заголовки, таблицы, сворачиваемые блоки; HTML-диалект rich-формата.
+        # Автоопределение сущностей выключено, иначе IP и порты превращаются в ссылки.
+        return {"html": text, "skip_entity_detection": True}
+
+    async def send(self, chat_id: int, text: str, markup: dict | None = None, reply_to: int | None = None,
+                   rich: bool = False):
         reply = {"message_id": reply_to, "allow_sending_without_reply": True} if reply_to else None
+        if rich:
+            return await self.call("sendRichMessage", chat_id=chat_id, rich_message=self._rich(text),
+                                   reply_markup=markup, reply_parameters=reply)
         return await self.call("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML",
                                reply_markup=markup, reply_parameters=reply,
                                link_preview_options={"is_disabled": True})
 
-    async def edit(self, chat_id: int, message_id: int, text: str, markup: dict | None = None):
+    async def edit(self, chat_id: int, message_id: int, text: str, markup: dict | None = None,
+                   rich: bool = False):
+        """Правит сообщение на месте; обычное и rich можно менять друг на друга."""
+        params = ({"rich_message": self._rich(text)} if rich
+                  else {"text": text, "parse_mode": "HTML", "link_preview_options": {"is_disabled": True}})
         try:
-            await self.call("editMessageText", chat_id=chat_id, message_id=message_id, text=text,
-                            parse_mode="HTML", reply_markup=markup, link_preview_options={"is_disabled": True})
+            await self.call("editMessageText", chat_id=chat_id, message_id=message_id, reply_markup=markup, **params)
         except TGError as e:
             if "not modified" not in str(e):
                 raise

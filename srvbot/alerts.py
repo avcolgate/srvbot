@@ -6,7 +6,7 @@ from datetime import datetime
 
 from . import checkhost, config, docker, manage, report, system, tunnel
 from .tg import Bot, kb
-from .util import CmdError, State, cut_html, esc, fmt_bytes, fmt_duration
+from .util import RICH_LEN, CmdError, State, cut_html, esc, fmt_bytes, fmt_duration
 
 log = logging.getLogger(__name__)
 
@@ -37,10 +37,11 @@ class Alerts:
         self.mass_drop: set[str] = set()       # контейнеры, где все клиенты пропали разом
         self.geo_nodes: dict = {}              # кэш узлов check-host для проверки из страны
 
-    async def send(self, text: str, markup=None, reply_to: int | None = None) -> dict | None:
+    async def send(self, text: str, markup=None, reply_to: int | None = None, rich: bool = False) -> dict | None:
         """Отправленное сообщение или None, если Telegram не принял."""
         try:
-            return await self.bot.send(config.OWNER_ID, cut_html(text), markup, reply_to)
+            return await self.bot.send(config.OWNER_ID, cut_html(text, RICH_LEN if rich else 4000, rich), markup,
+                                       reply_to, rich=rich)
         except Exception:
             log.exception("send failed")
             return None
@@ -100,7 +101,7 @@ class Alerts:
             if c is None:
                 await self.set(f"ctr:{name}", True, f"контейнер {name}",
                                "исчез (удалён?). Если так и задумано — нажмите «Забыть»",
-                               markup=forget_kb("ctr", name, ("🔧 Службы", "nv:svc")))
+                               markup=forget_kb("ctr", name, ("📊 Сервер", "nv:status")))
             elif not c.watched:
                 self.forget("ctr", name)  # restart policy убрали — больше не следим
             else:
@@ -113,13 +114,13 @@ class Alerts:
                        markup=buttons(("🧹 Очистить диск", "nv:clean")))
         await self.set("cpu", m.cpu_pct >= config.CPU_PCT, "CPU",
                        f"загрузка {m.cpu_pct:.0f}% уже {config.SUSTAIN_CHECKS} мин", sustain=config.SUSTAIN_CHECKS,
-                       markup=buttons(("📊 Сервер", "nv:status"), ("🔧 Службы", "nv:svc")))
+                       markup=buttons(("📊 Сервер", "nv:status")))
         psi = m.mem_psi_full or 0
         mem_bad = m.mem_avail_pct < config.MEM_AVAIL_PCT or psi >= config.MEM_PSI_FULL
         await self.set("mem", mem_bad, "память",
                        f"доступно {m.mem_avail_pct:.0f}% RAM, давление {psi:.0f}% уже {config.SUSTAIN_CHECKS} мин",
                        sustain=config.SUSTAIN_CHECKS,
-                       markup=buttons(("📊 Сервер", "nv:status"), ("🔧 Службы", "nv:svc")))
+                       markup=buttons(("📊 Сервер", "nv:status")))
 
     async def check_ports(self):
         cur, stale = system.listening()
@@ -136,7 +137,7 @@ class Alerts:
             problem = (f"привязан к адресу {stale[p]}, которого больше нет на сервере" if p in stale
                        else "больше не слушается") + ". Если так и задумано — нажмите «Забыть»"
             await self.set(f"port:{p}", p not in cur, f"порт {p} ({proc})", problem,
-                           sustain=config.PORT_MISS_CHECKS, markup=forget_kb("port", p, ("🔧 Службы", "nv:svc")))
+                           sustain=config.PORT_MISS_CHECKS, markup=forget_kb("port", p, ("📊 Сервер", "nv:status")))
 
     def _unpublished(self, port: str) -> bool:
         """Порт «udp/443» снят с публикации намеренно: docker ответил, ни один отслеживаемый контейнер
@@ -350,7 +351,7 @@ class Alerts:
         # Отметку «отправлено» ставим только после успешной отправки: сбой — повторим через минуту
         if now.weekday() >= config.WEEKLY_WEEKDAY and self.state["last_weekly"] != week:
             text, snap = await report.build(self.state)
-            if await self.send(text):
+            if await self.send(text, rich=True):
                 self.state["snap"], self.state["last_weekly"] = snap, week
                 self.state.save()
 

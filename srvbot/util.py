@@ -5,6 +5,7 @@ import json
 import os
 import re
 import time
+from datetime import datetime
 
 from . import config
 
@@ -69,7 +70,7 @@ def fmt_ago(ts: float, now: float | None = None) -> str:
     return f"{d // 86400} дн назад"
 
 
-IND = "\u00a0" * 6  # отступ второй строки карточки (обычные пробелы Telegram может съесть)
+RICH_LEN = 30000     # лимит rich-сообщения 32768 символов; обычного — 4096
 
 
 def fmt_duration(sec: float) -> str:
@@ -116,11 +117,12 @@ class State:
 
 
 
-_TAG = re.compile(r"<(/?)(b|i|u|s|code|pre|a)(?:\s[^>]*)?>")
+_TAG = re.compile(r"<(/?)(b|i|u|s|code|pre|a|p|h[1-6]|table|tr|td|th|details|summary|blockquote|footer|ul|ol|li"
+                  r"|mark|tg-button|tg-time)(?:\s[^>]*)?>")
 
 
-def cut_html(text: str, limit: int = 4000) -> str:
-    """Обрезает HTML-сообщение для Telegram (лимит 4096): по границе строки и с закрытием
+def cut_html(text: str, limit: int = 4000, rich: bool = False) -> str:
+    """Обрезает HTML-сообщение для Telegram (лимит 4096, у rich — 32768): по границе строки и с закрытием
     незакрытых тегов — иначе Telegram отвергает сообщение («can't parse entities»)."""
     if len(text) <= limit:
         return text
@@ -141,4 +143,45 @@ def cut_html(text: str, limit: int = 4000) -> str:
                 stack.pop()
         else:
             stack.append(m.group(2))
-    return head + "".join(f"</{t}>" for t in reversed(stack)) + "\n…"
+    return head + "".join(f"</{t}>" for t in reversed(stack)) + ("<p>…</p>" if rich else "\n…")
+
+
+# --- rich-формат сообщений (Bot API 10.1+): заголовки, таблицы, сворачиваемые блоки, кнопки в тексте ---
+
+def h(text: str, size: int = 3) -> str:
+    return f"<h{size}>{text}</h{size}>"
+
+
+def p(*lines: str) -> str:
+    """Абзац; пустые строки пропускаются."""
+    return "<p>" + "<br/>".join(l for l in lines if l) + "</p>"
+
+
+def table(rows: list[list[str]], header: list[str] | None = None) -> str:
+    body = "".join("<tr>" + "".join(f"<td>{c}</td>" for c in r) + "</tr>" for r in rows)
+    head = "<tr>" + "".join(f"<th>{c}</th>" for c in header) + "</tr>" if header else ""
+    return f"<table compact>{head}{body}</table>"
+
+
+def details(summary: str, body: str, open_: bool = False) -> str:
+    return f"<details{' open' if open_ else ''}><summary>{summary}</summary>{body}</details>"
+
+
+def btn(text: str, data: str, style: str = "") -> str:
+    """Кнопка прямо в тексте. Слишком длинные callback_data (лимит 64 байта) — без кнопки."""
+    if len(data.encode()) > 64:
+        return ""
+    attrs = f'type="callback_data" data="{html.escape(data)}"' + (f' style="{style}"' if style else "")
+    return f"<tg-button {attrs}>{text}</tg-button>"
+
+
+def tg_time(ts: float, fmt: str = "r") -> str:
+    """Время, которое Telegram показывает в часовом поясе и языке читателя: r — «2 часа назад»,
+    t/T — время, d/D — дата, w — день недели. Внутри — запасной текст для старых клиентов."""
+    fallback = fmt_ago(ts) if fmt == "r" else f"{datetime.fromtimestamp(ts, config.TZ):%H:%M:%S}"
+    return f'<tg-time unix="{int(ts)}" format="{fmt}">{fallback}</tg-time>'
+
+
+def mark(text: str, bad: bool = True) -> str:
+    """Подсветка проблемной строки."""
+    return f"<mark>{text}</mark>" if bad else text

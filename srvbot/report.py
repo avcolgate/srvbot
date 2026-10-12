@@ -4,7 +4,7 @@ import time
 from datetime import datetime
 
 from . import config, system, tunnel
-from .util import CmdError, State, esc, fmt_bytes
+from .util import CmdError, State, esc, fmt_bytes, h, p, table
 
 
 def delta(cur: int, prev: int | None) -> int:
@@ -41,7 +41,7 @@ async def build(state: State) -> tuple[str, dict]:
     since = prev.get("ts")
     now = datetime.now(config.TZ)
     period = f" (с {datetime.fromtimestamp(since, config.TZ):%d.%m %H:%M})" if since else ""
-    lines = [f"<b>📋 Отчёт {now:%d.%m.%Y}</b>{period}"]
+    lines = [h(f"📋 Отчёт {now:%d.%m.%Y}") + (p(f"<i>{period.strip(' ()')}</i>") if period else "")]
     try:
         insts = await tunnel.collect()
     except CmdError as e:  # docker не ответил — отчёт всё равно соберём, без раздела клиентов
@@ -51,26 +51,26 @@ async def build(state: State) -> tuple[str, dict]:
 
     f2b = [f"{esc(j.name)} +{d}" for j in jails if (d := delta(j.total_banned, prev.get("f2b", {}).get(j.name)))]
     if f2b:
-        lines.append("🛡 баны fail2ban: " + ", ".join(f2b))
+        lines.append(p("🛡 баны fail2ban: " + ", ".join(f2b)))
 
     if insts:
-        lines.append("\n<b>🔐 Клиенты</b> — трафик за период")
+        lines.append(h("🔐 Клиенты — трафик за период", 4))
     rows = []
     for inst in insts:
         if inst.error:
-            lines.append(f"🔴 {esc(inst.container)}: {esc(inst.error)}")
-        for p in inst.peers:
-            pr = prev.get("tunnel", {}).get(f"{inst.container}/{p.pubkey}", [None, None])
-            drx, dtx = delta(p.rx, pr[0]), delta(p.tx, pr[1])
+            lines.append(p(f"🔴 {esc(inst.container)}: {esc(inst.error)}"))
+        for peer in inst.peers:
+            pr = prev.get("tunnel", {}).get(f"{inst.container}/{peer.pubkey}", [None, None])
+            drx, dtx = delta(peer.rx, pr[0]), delta(peer.tx, pr[1])
             if drx + dtx:
-                em = (state.data.get("tunnel_emoji") or {}).get(p.pubkey, "•")
-                rows.append((drx + dtx, f"{em} <b>{esc(p.label)}</b> — ↓ {fmt_bytes(dtx)} · ↑ {fmt_bytes(drx)}"))
+                em = (state.data.get("tunnel_emoji") or {}).get(peer.pubkey, "•")
+                rows.append((drx + dtx, [f"{em} <b>{esc(peer.label)}</b>", f"↓ {fmt_bytes(dtx)}", f"↑ {fmt_bytes(drx)}"]))
     if rows:
         rows.sort(key=lambda r: -r[0])
-        lines += [r for _, r in rows]
-        lines.append(f"<i>Σ {fmt_bytes(sum(r[0] for r in rows))}</i>")
+        lines.append(table([r for _, r in rows]))
+        lines.append(p(f"<i>Σ {fmt_bytes(sum(r[0] for r in rows))}</i>"))
     elif insts:
-        lines.append("трафика не было")
+        lines.append(p("трафика не было"))
 
-    return "\n".join(lines), snapshot(insts, jails)
+    return "".join(lines), snapshot(insts, jails)
 

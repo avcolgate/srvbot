@@ -6,11 +6,12 @@ import time
 from datetime import datetime
 
 from . import checkhost, config, docker, geoip, manage, report, system, tunnel
-from .util import IND, CmdError, esc, fmt_ago, fmt_bytes, fmt_duration
+from .util import CmdError, btn, details, esc, fmt_ago, fmt_bytes, fmt_duration, h, mark, p, table, tg_time
 
 
 def _bar(pct: float) -> str:
     return "🔴" if pct >= 90 else "🟡" if pct >= 75 else "🟢"
+
 
 
 def unit_icon(state: str) -> str:
@@ -19,53 +20,65 @@ def unit_icon(state: str) -> str:
 
 async def status() -> str:
     m = system.metrics(await system.cpu_now())
-    lines = ["<b>📊 Сервер</b>",
-             f"⏱ аптайм {fmt_duration(m.uptime)}, load {m.load[0]:.2f} / {m.load[1]:.2f} / {m.load[2]:.2f}",
-             f"{_bar(m.cpu_pct)} CPU {m.cpu_pct:.0f}%",
-             f"{_bar(100 - m.mem_avail_pct)} RAM доступно {fmt_bytes(m.mem_avail)} из {fmt_bytes(m.mem_total)}"
-             + (f", swap {fmt_bytes(m.swap_used)}/{fmt_bytes(m.swap_total)}" if m.swap_total else ""),
-             f"{_bar(m.disk_pct)} диск {m.disk_pct:.0f}%, свободно {fmt_bytes(m.disk_free)}",
-             f"🌐 IP {esc(', '.join(system.public_ipv4()) or 'нет внешнего IPv4')}"]
+    blocks = [h("📊 Сервер"),
+              p(f"⏱ аптайм {fmt_duration(m.uptime)}, load {m.load[0]:.2f} / {m.load[1]:.2f} / {m.load[2]:.2f}",
+                f"🌐 IP {esc(', '.join(system.public_ipv4()) or 'нет внешнего IPv4')}"),
+              table([[f"{_bar(m.cpu_pct)} CPU", f"{m.cpu_pct:.0f}%"],
+                     [f"{_bar(100 - m.mem_avail_pct)} RAM", f"доступно {fmt_bytes(m.mem_avail)} из {fmt_bytes(m.mem_total)}"
+                      + (f", swap {fmt_bytes(m.swap_used)}/{fmt_bytes(m.swap_total)}" if m.swap_total else "")],
+                     [f"{_bar(m.disk_pct)} диск", f"{m.disk_pct:.0f}%, свободно {fmt_bytes(m.disk_free)}"]])]
+    # службы и контейнеры — с кнопками перезапуска и журнала прямо в строке;
     # каждая внешняя команда в своём try: зависшая одна не должна ронять весь раздел
+    svc = []
     try:
         states = await manage.unit_states()
-        lines.append("🔧 " + " · ".join(f"{unit_icon(states.get(u, '?'))} {u}" for u in manage.SERVICES))
+        for u in manage.SERVICES:
+            st = states.get(u, "?")
+            line = f"{unit_icon(st)} {u}"
+            if u in manage.RESTARTABLE:
+                line += f" {btn('🔄', f'go:unit:{u}')}"
+            svc.append(mark(line, st not in ("active", "activating", "reloading")) + f" {btn('📜', f'lg:u:{u}')}")
     except CmdError as e:
-        lines.append(f"🔴 службы: {esc(e)}")
+        svc.append(f"🔴 службы: {esc(e)}")
     jails = await system.jails()
-    lines.append("🛡 fail2ban: " + (" · ".join(f"{esc(j.name)} сейчас {len(j.banned_now)}" for j in jails)
-                                    if jails else "не отвечает"))
+    svc.append("🛡 fail2ban: " + (" · ".join(f"{esc(j.name)} сейчас {len(j.banned_now)}" for j in jails)
+                                  if jails else "не отвечает"))
     upd, sec = system.updates()
     if upd:
-        lines.append(f"📦 обновлений: {upd}" + (f" (безопасности {sec})" if sec else ""))
-    lines.append("\n<b>🐳 Контейнеры</b>")
+        svc.append(f"📦 обновлений: {upd}" + (f" (безопасности {sec})" if sec else ""))
+    blocks += [h("🔧 Службы", 4), p(*svc)]
+    ctr_lines = []
     try:
         ctrs = await docker.containers()
     except CmdError as e:  # docker завис (например, сервер перегружен) — показываем, что знали до этого
-        lines.append(f"🔴 docker не отвечает: {esc(e)}")
+        ctr_lines.append(f"🔴 docker не отвечает: {esc(e)}")
         ctrs = []
         if last := docker.cached():
-            lines.append(f"<i>по данным {fmt_ago(last[0])}:</i>")
+            ctr_lines.append(f"<i>по данным {tg_time(last[0])}:</i>")
             ctrs = last[1]
     for c in ctrs:
-        icon = "🟢" if c.running else ("🔴" if c.watched else "⚪")
-        lines.append(f"{icon} {esc(c.name)} — {esc(c.status)}")
+        line = f"{'🟢' if c.running else ('🔴' if c.watched else '⚪')} {esc(c.name)} — {esc(c.status)}"
+        ctr_lines.append(mark(line, c.watched and not c.running)
+                         + (f" {btn('🔄', f'go:restart:{c.name}')}" if c.watched else "")
+                         + f" {btn('📜', f'lg:c:{c.name}')}")
+    blocks += [h("🐳 Контейнеры", 4), p(*(ctr_lines or ["нет контейнеров"]))]
     ports, stale = system.listening()
     if ports:
-        lines.append("\n<b>🔌 Порты</b>")
         by_proc: dict[str, list[str]] = {}
-        for p, proc in sorted(ports.items(), key=lambda kv: int(kv[0].split("/")[1])):
-            by_proc.setdefault(proc, []).append(p)
-        lines += [f"{esc(proc)}: {', '.join(ps)}" for proc, ps in by_proc.items()]
-    lines += [f"🔴 {esc(p)} привязан к {esc(ip)} — этого адреса больше нет на сервере" for p, ip in stale.items()]
+        for port, proc in sorted(ports.items(), key=lambda kv: int(kv[0].split("/")[1])):
+            by_proc.setdefault(proc, []).append(port)
+        blocks.append(details("🔌 Порты", p(*[f"{esc(proc)}: {', '.join(ps)}" for proc, ps in by_proc.items()])))
+    if stale:
+        blocks.append(p(*[mark(f"🔴 {esc(port)} привязан к {esc(ip)} — этого адреса больше нет на сервере")
+                          for port, ip in stale.items()]))
     certs = await system.certs()
     if certs:
-        lines.append("\n<b>🔒 Сертификаты</b>")
-        lines += [f"{'🟢' if c.days_left >= config.CERT_WARN_DAYS else '🔴'} {esc(c.name)}: {c.days_left} дн."
-                  for c in certs]
+        blocks.append(details("🔒 Сертификаты", p(*[
+            mark(f"{'🟢' if c.days_left >= config.CERT_WARN_DAYS else '🔴'} {esc(c.name)}: {c.days_left} дн.",
+                 c.days_left < config.CERT_WARN_DAYS) for c in certs])))
     if system.reboot_required():
-        lines.append("\n⚠️ требуется перезагрузка")
-    return "\n".join(lines)
+        blocks.append(p(mark("⚠️ требуется перезагрузка")))
+    return "".join(blocks)
 
 
 is_online = tunnel.is_online
@@ -73,7 +86,6 @@ is_online = tunnel.is_online
 
 NAME_MAX = 12   # длиннее — обрезаем, чтобы строка влезала в экран телефона
 ORG_MAX = 14
-IND2 = "\u00a0" * 3
 
 
 def _short(text: str, n: int) -> str:
@@ -89,19 +101,14 @@ def _where(g: dict | None) -> str:
     return " ".join(x for x in (checkhost.flag(g["cc"]) if g.get("cc") else "", _short(g.get("org", ""), ORG_MAX)) if x)
 
 
-def peer_line(p: tunnel.Peer, now: float, geo: dict | None = None, emoji: str = "") -> str:
-    """Две строки: «🟢 🦊 имя · 10.0.0.2» и «↓4.8 ГБ ↑212 МБ · 🇩🇪 Example ISP»."""
-    head = f"{emoji + ' ' if emoji else ''}<b>{esc(_short(p.label, NAME_MAX))}</b> · <code>{esc(p.ip)}</code>"
-    if is_online(p, now):
-        head = f"🟢 {head}"
-    elif p.handshake:
-        head = f"⚪ {head} · <i>{fmt_ago(p.handshake, now).removesuffix(' назад')}</i>"
-    else:
-        head = f"⚪ {head}"
-    tail = [f"↓{fmt_bytes(p.tx)} ↑{fmt_bytes(p.rx)}"] if p.rx + p.tx else []
-    if p.endpoint_ip and (where := _where(geo)):
-        tail.append(esc(where))
-    return head + (f"\n{IND2}" + " · ".join(tail) if tail else "")
+def peer_cells(p: tunnel.Peer, now: float, geo: dict | None = None, emoji: str = "") -> list[str]:
+    """Строка таблицы клиентов: кто · трафик · откуда и когда."""
+    icon = "🟢" if is_online(p, now) else "⚪"
+    who = f"{icon} {emoji + ' ' if emoji else ''}<b>{esc(_short(p.label, NAME_MAX))}</b><br/><code>{esc(p.ip)}</code>"
+    traffic = f"↓{fmt_bytes(p.tx)}<br/>↑{fmt_bytes(p.rx)}" if p.rx + p.tx else "—"
+    where = esc(_where(geo)) if p.endpoint_ip else ""
+    when = "" if is_online(p, now) else (f"<i>{tg_time(p.handshake)}</i>" if p.handshake else "<i>не подключался</i>")
+    return [who, traffic, "<br/>".join(x for x in (where, when) if x) or "—"]
 
 
 async def _geo_all(pool, peers: list[tunnel.Peer]) -> dict[str, dict]:
@@ -133,32 +140,31 @@ def risk_card(state: dict, insts: list[tunnel.Instance] | None = None) -> str:
     if config.GEO_COUNTRY:
         flag = checkhost.flag(config.GEO_COUNTRY)
         geo = state.get("geo_last")
-        hist = [h for h in state.get("geo_hist", []) if now - h[0] < 86400]
+        hist = [x for x in state.get("geo_hist", []) if now - x[0] < 86400]
         if geo and geo.get("cc") == config.GEO_COUNTRY:
-            mark = "❌" if geo["fail"] else ("✅" if geo["ok"] else "⚪")
-            line = f"{flag} последняя проверка {fmt_ago(geo['ts'], now)}: {mark} {geo['ok']}/{geo['total']} узлов"
+            icon = "❌" if geo["fail"] else ("✅" if geo["ok"] else "⚪")
+            line = f"{flag} последняя проверка {tg_time(geo['ts'])}: {icon} {geo['ok']}/{geo['total']} узлов"
             if geo["fail"]:
                 line += f" ({esc(', '.join(geo['failed']))})"
             if hist:
-                bad = sum(1 for h in hist if h[2])
-                line += f" · за сутки проверок {len(hist)}, неудачных {bad}"
-            lines.append(line)
+                line += f" · за сутки проверок {len(hist)}, неудачных {sum(1 for x in hist if x[2])}"
+            lines.append(mark(line, bool(geo["fail"])))
         else:
             lines.append(f"{flag} доступность ещё не проверялась")
     day = state.get("traffic_day") or {}
     if insts and day.get("date"):
         _, rx, tx = report.day_traffic(day, insts, day["date"])
-        now_online = sum(is_online(p, now) for i in insts if not i.error for p in i.peers)
+        now_online = sum(is_online(x, now) for i in insts if not i.error for x in i.peers)
         total = sum(len(i.peers) for i in insts if not i.error)
         lines.append(f"📈 трафик за сегодня ↓{fmt_bytes(tx)} ↑{fmt_bytes(rx)} · в сети {now_online}/{total}")
-    return "\n".join(lines)
+    return "<blockquote>" + "<br/>".join(lines) + "</blockquote>"
 
 
 async def geo_view(pool, state: dict | None = None) -> str:
     target = ssh_target()
     if not target:
-        return "<b>🌍 Доступность</b>\n🔴 у сервера нет внешнего IPv4"
-    card = ""
+        return h("🌍 Доступность") + p("🔴 у сервера нет внешнего IPv4")
+    blocks = [h("🌍 Доступность")]
     if state is not None:
         insts = None
         if tunnel.found():
@@ -166,39 +172,38 @@ async def geo_view(pool, state: dict | None = None) -> str:
                 insts = await tunnel.collect()
             except CmdError:
                 pass
-        card = risk_card(state, insts) + "\n\n"
+        blocks.append(risk_card(state, insts))
     started = time.monotonic()
     try:
         info = await asyncio.get_running_loop().run_in_executor(pool, checkhost.node_info)
         res = await checkhost.check(pool, target, sorted(info))
     except checkhost.CheckHostError as e:
-        return f"{card}<b>🌍 Доступность</b>\n🔴 check-host.net не ответил: {esc(e)}"
+        return "".join(blocks) + p(f"🔴 check-host.net не ответил: {esc(e)}")
     countries = checkhost.by_country(res, info, first=config.GEO_COUNTRY)
     n_ok = sum(v is True for v in res.values())
-    lines = [f"{card}<b>🌍 Доступность {esc(target)}</b>", ""]
     for c in countries:
         if c.cc != config.GEO_COUNTRY:
             continue
-        lines.append(f"{checkhost.flag(c.cc)} <b>{esc(c.name)}</b> — {len(c.ok)}/{len(c.ok) + len(c.fail) + len(c.silent)}")
-        lines += [f"{IND}✅ {esc(city)}" for city in c.ok]
-        lines += [f"{IND}❌ {esc(city)}" for city in c.fail]
-        lines += [f"{IND}⚪ {esc(city)} — не ответил" for city in c.silent]
+        blocks.append(h(f"{checkhost.flag(c.cc)} {esc(c.name)} — {len(c.ok)}/{len(c.ok) + len(c.fail) + len(c.silent)}", 4))
+        blocks.append(table([[esc(city), "✅"] for city in c.ok] + [[mark(esc(city)), "❌"] for city in c.fail]
+                            + [[esc(city), "⚪ не ответил"] for city in c.silent]))
     bad = [c for c in countries if c.cc != config.GEO_COUNTRY and c.fail]
     if bad:
-        lines.append("\n🔴 <b>Недоступен</b>")
-        lines += [f"{checkhost.flag(c.cc)} {esc(c.name)}: ❌ {esc(', '.join(c.fail))}"
-                  + (f" · ✅ {esc(', '.join(c.ok))}" if c.ok else "") for c in bad]
+        blocks.append(h("🔴 Недоступен", 4))
+        blocks.append(p(*[mark(f"{checkhost.flag(c.cc)} {esc(c.name)}: ❌ {esc(', '.join(c.fail))}")
+                          + (f" · ✅ {esc(', '.join(c.ok))}" if c.ok else "") for c in bad]))
     good = [c for c in countries if c.cc != config.GEO_COUNTRY and c.ok and not c.fail]
     if good:
-        lines.append(f"\n🟢 <b>Доступен</b> из {len(good)} стран:")
-        lines.append("".join(checkhost.flag(c.cc) for c in good))
+        blocks.append(details(f"🟢 Доступен из {len(good)} стран", p(" ".join(
+            f"{checkhost.flag(c.cc)} {esc(c.name)}" for c in good))))
     silent = [c for c in countries if c.cc != config.GEO_COUNTRY and not c.ok and not c.fail]
     if silent:
-        lines.append(f"\n⚪ Не ответили: {''.join(checkhost.flag(c.cc) for c in silent)}")
+        blocks.append(details(f"⚪ Не ответили: {len(silent)}", p(" ".join(
+            f"{checkhost.flag(c.cc)} {esc(c.name)}" for c in silent))))
     n_silent = sum(v is None for v in res.values())
-    lines.append(f"\n<i>TCP-подключение к порту SSH · доступен с {n_ok} из {len(res)} узлов"
-                 + (f", {n_silent} не ответили" if n_silent else "") + f" · {time.monotonic() - started:.0f} с</i>")
-    return "\n".join(lines)
+    blocks.append(p(f"<i>TCP-подключение к порту SSH {esc(target)} · доступен с {n_ok} из {len(res)} узлов"
+                    + (f", {n_silent} не ответили" if n_silent else "") + f" · {time.monotonic() - started:.0f} с</i>"))
+    return "".join(blocks)
 
 
 async def tunnel_view(insts: list[tunnel.Instance] | None = None, pool=None, emojis: dict | None = None) -> str:
@@ -206,55 +211,53 @@ async def tunnel_view(insts: list[tunnel.Instance] | None = None, pool=None, emo
         try:
             insts = await tunnel.collect()
         except CmdError as e:  # docker завис — честно скажем, а не «не удалось открыть раздел»
-            return f"<b>🔐 Клиенты</b>\n🔴 docker не отвечает: {esc(e)}"
+            return h("🔐 Клиенты") + p(f"🔴 docker не отвечает: {esc(e)}")
     if not insts:
-        return ("<b>🔐 Клиенты</b>\nтуннель на сервере не найден: нет docker-контейнера "
-                "с подходящей утилитой (см. README, раздел про настройки)")
+        return h("🔐 Клиенты") + p("туннель на сервере не найден: нет docker-контейнера "
+                                    "с подходящей утилитой (см. README, раздел про настройки)")
     now = time.time()
-    blocks = []
+    blocks = [h("🔐 Клиенты")]
     for inst in insts:
         peers = inst.peers
-        n_online = sum(is_online(p, now) for p in peers)
-        head = f"<b>🔐 {esc(inst.container)}</b>"
+        head = esc(inst.container)
         if not inst.error:
-            head += f" · в сети <b>{n_online}</b>/{len(peers)}"
-        lines = [head]
+            head += f" · в сети {sum(is_online(x, now) for x in peers)}/{len(peers)}"
+        blocks.append(h(head, 4))
         meta = []
         if inst.version:
             m = re.search(r"v\d[\w.]*", inst.version)
             meta.append(esc(m.group(0) if m else inst.version))
-        meta += [p.split("/")[1].upper() + " " + p.split("/")[0] for p in inst.ports]
-        if meta:
-            lines.append("<i>" + " · ".join(meta) + "</i>")
+        meta += [x.split("/")[1].upper() + " " + x.split("/")[0] for x in inst.ports]
         if inst.error:
-            lines.append(f"\n🔴 не удалось прочитать данные: {esc(inst.error)}")
-            blocks.append("\n".join(lines))
+            blocks.append(p(f"<i>{' · '.join(meta)}</i>" if meta else "", f"🔴 не удалось прочитать данные: {esc(inst.error)}"))
             continue
-        lines.append("")
         peers = tunnel.sort_by_ip(peers)
         geo = await _geo_all(pool, peers) if pool else {}
-        lines += [peer_line(p, now, geo.get(p.endpoint_ip), (emojis or {}).get(p.pubkey, "")) for p in peers]
-        total = f"Σ ↓{fmt_bytes(sum(p.tx for p in peers))} ↑{fmt_bytes(sum(p.rx for p in peers))}"
+        blocks.append(table([peer_cells(x, now, geo.get(x.endpoint_ip), (emojis or {}).get(x.pubkey, "")) for x in peers]))
+        total = f"Σ ↓{fmt_bytes(sum(x.tx for x in peers))} ↑{fmt_bytes(sum(x.rx for x in peers))}"
         if inst.started_at:
             total += f" за {fmt_duration(now - inst.started_at)}"
-        lines.append(f"\n<i>{total}</i>")
+        tail = [f"<i>{total}</i>"] + ([f"<i>{' · '.join(meta)}</i>"] if meta else [])
         if not inst.names_source:
-            lines.append("<i>список клиентов не найден — вместо имён ключи</i>")
-        blocks.append("\n".join(lines))
-    return "\n\n".join(blocks)
+            tail.append("<i>список клиентов не найден — вместо имён ключи</i>")
+        blocks.append(p(*tail))
+    return "".join(blocks)
 
 
-async def bans() -> tuple[str, list[tuple[str, str]]]:
-    """Текст и список (jail, ip) забаненных сейчас."""
+async def bans() -> str:
+    """Забаненные сейчас по jail'ам; кнопка «Разбанить» — в строке с адресом."""
     jails = await system.jails()
     if not jails:
-        return "<b>🛡 fail2ban</b>\nне отвечает", []
-    lines, banned = ["<b>🛡 fail2ban</b>"], []
+        return h("🛡 fail2ban") + p("не отвечает")
+    blocks = [h("🛡 fail2ban"),
+              table([[f"<b>{esc(j.name)}</b>", str(len(j.banned_now)), str(j.total_banned), str(j.total_failed)]
+                     for j in jails], header=["jail", "сейчас", "всего", "неудач"])]
     for j in jails:
-        lines.append(f"<b>{esc(j.name)}</b>: сейчас {len(j.banned_now)}, всего {j.total_banned}, неудач {j.total_failed}")
-        lines += [f"  • {esc(ip)}" for ip in j.banned_now[:20]]
+        if not j.banned_now:
+            continue
+        rows = [[f"<code>{esc(ip)}</code>", btn("Разбанить", f"ub:{j.name}:{ip}")] for ip in j.banned_now[:20]]
         if len(j.banned_now) > 20:
-            lines.append(f"  … и ещё {len(j.banned_now) - 20}")
-        banned += [(j.name, ip) for ip in j.banned_now[:20]]
-    lines.append("<i>счётчики «всего» — с последнего запуска fail2ban</i>")
-    return "\n".join(lines), banned
+            rows.append([f"… и ещё {len(j.banned_now) - 20}", ""])
+        blocks.append(details(f"{esc(j.name)}: {len(j.banned_now)} адресов", table(rows)))
+    blocks.append(p("<i>счётчики «всего» — с последнего запуска fail2ban</i>"))
+    return "".join(blocks)
