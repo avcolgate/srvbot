@@ -128,13 +128,15 @@ _LEVEL = {"error": "🔴", "fatal": "🔴", "panic": "🔴", "warning": "⚠️"
 
 
 def compact_line(line: str) -> str:
-    """Строка journalctl -o short — короче, чтобы читалась на телефоне: «12:29:31 сообщение» без даты, хоста
-    и процесса; строки в формате logfmt (dockerd, containerd: time=… level=… msg=…) — «⚠️ msg: error».
-    Обрезаем до 200 символов: очень длинные строки в <pre> телефон может не отрисовать."""
-    m = re.match(r"\w{3} +\d+ (\d\d:\d\d:\d\d) \S+ [^\s:]+(?:\[\d+\])?: (.*)", line)
+    """Строка journalctl -o short-iso — короче, чтобы читалась на телефоне: «12:29:31 сообщение» без даты, хоста
+    и процесса, время — в часовом поясе бота (TIMEZONE), а не сервера; строки в формате logfmt (dockerd,
+    containerd: time=… level=… msg=…) — «⚠️ msg: error». Обрезаем до 200 символов: очень длинные строки
+    в <pre> телефон может не отрисовать."""
+    m = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d\d:?\d\d) \S+ [^\s:]+(?:\[\d+\])?: (.*)", line)
     if not m:
         return line[:200]
-    when, text = m.groups()
+    stamp, text = m.groups()
+    when = f"{datetime.fromisoformat(stamp).astimezone(config.TZ):%H:%M:%S}"
     if "msg=" in text and "level=" in text:
         f = {k: (r.search(text) or [None, ""])[1].strip('"').replace('\\"', '"') for k, r in _LOGFMT.items()}
         err = f["error"] or f["err"] or f["error-response"]
@@ -143,7 +145,7 @@ def compact_line(line: str) -> str:
 
 
 async def unit_logs(unit: str, n: int = 25) -> str:
-    return await run("journalctl", "-u", unit_name(unit), "-n", str(n), "--no-pager", "-o", "short", check=False)
+    return await run("journalctl", "-u", unit_name(unit), "-n", str(n), "--no-pager", "-o", "short-iso", check=False)
 
 
 async def container_logs(name: str, n: int = 25) -> str:

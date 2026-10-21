@@ -82,14 +82,22 @@ class ContainerHistory(unittest.TestCase):
 
 
 class CompactLine(unittest.TestCase):
+    def setUp(self):
+        from unittest import mock
+        from zoneinfo import ZoneInfo
+        p = mock.patch.object(manage.config, "TZ", ZoneInfo("Europe/Moscow"))  # +3, как у владельца
+        p.start()
+        self.addCleanup(p.stop)
+
     def test_logfmt_and_plain(self):
-        dockerd = ('Oct 21 16:05:20 host dockerd[963087]: time="2026-10-21T16:05:20.71+02:00" level=error '
+        dockerd = ('2026-10-21T16:05:20+02:00 host dockerd[963087]: time="2026-10-21T16:05:20.71+02:00" level=error '
                    'msg="Handler for GET /containers/{name:.*}/logs returned error" '
                    'error-response="configured logging driver does not support reading" method=GET module=api')
-        self.assertEqual(manage.compact_line(dockerd), "16:05:20 🔴 Handler for GET /containers/{name:.*}/logs "
+        self.assertEqual(manage.compact_line(dockerd), "17:05:20 🔴 Handler for GET /containers/{name:.*}/logs "
                                                         "returned error: configured logging driver does not support reading")
-        self.assertEqual(manage.compact_line("Oct 21 06:20:42 host fail2ban-server[1]: Server ready"),
-                         "06:20:42 Server ready")
-        self.assertEqual(manage.compact_line("Oct 21 06:20:41 host systemd[1]: Started x."), "06:20:41 Started x.")
-        self.assertLessEqual(len(manage.compact_line("Oct 21 06:20:41 host x[1]: " + "a" * 1000)), 200)
+        self.assertEqual(manage.compact_line("2026-10-21T06:20:42+02:00 host fail2ban-server[1]: Server ready"),
+                         "07:20:42 Server ready")  # сервер +2, бот — в своём поясе
+        self.assertEqual(manage.compact_line("2026-10-21T04:20:41+00:00 host systemd[1]: Started x."),
+                         "07:20:41 Started x.")
+        self.assertLessEqual(len(manage.compact_line("2026-10-21T06:20:41+02:00 host x[1]: " + "a" * 1000)), 200)
         self.assertEqual(manage.compact_line("-- No entries --"), "-- No entries --")
