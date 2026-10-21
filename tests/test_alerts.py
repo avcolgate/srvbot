@@ -85,14 +85,14 @@ class MainKeyboard(unittest.TestCase):
             rows = handlers.main_kb()["keyboard"]
         return [b["text"] if isinstance(b, dict) else b for row in rows for b in row]
 
-    def test_five_buttons_with_tunnel(self):
+    def test_four_buttons_with_tunnel(self):
         labels = self.labels(True)
-        self.assertEqual(len(labels), 5)
+        self.assertEqual(len(labels), 4)
         self.assertEqual(labels[0], handlers.BTN["status"])
         self.assertNotIn("🛡 Баны", labels)
 
-    def test_four_buttons_without_tunnel(self):
-        self.assertEqual(len(self.labels(False)), 4)
+    def test_three_buttons_without_tunnel(self):
+        self.assertEqual(len(self.labels(False)), 3)
 
     def test_bans_stays_a_command(self):
         self.assertEqual(handlers.COMMANDS["bans"], "bans")

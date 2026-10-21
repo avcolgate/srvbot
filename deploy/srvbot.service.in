@@ -11,7 +11,7 @@ WorkingDirectory=@DIR@
 ExecStart=/usr/bin/python3 -m srvbot
 Restart=always
 RestartSec=10
-MemoryMax=200M
+MemoryMax=300M
 Environment=PYTHONUNBUFFERED=1
 
 [Install]

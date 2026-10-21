@@ -263,6 +263,13 @@ def mass_drop(prev_online: int, now_online: int) -> bool:
     return prev_online >= 2 and now_online == 0
 
 
+def shared_network(peers: list[Peer], now: float) -> bool:
+    """Все клиенты в сети выходят с одного внешнего адреса (например, планшет на раздаче с телефона):
+    их общее исчезновение — скорее пропавшая у них сеть, чем блокировка сервера."""
+    ips = [p.endpoint_ip for p in peers if is_online(p, now)]
+    return len(ips) >= 2 and None not in ips and len(set(ips)) == 1
+
+
 def is_tunnel(c: docker.Container) -> bool:
     s = f"{c.name} {c.image}".lower()
     return any(m in s for m in config.TUNNEL_MATCH)

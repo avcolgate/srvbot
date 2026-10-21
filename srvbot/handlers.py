@@ -7,27 +7,27 @@ import socket
 import time
 from datetime import datetime
 
-from . import config, docker, manage, report, system, tunnel, views
+from . import config, docker, manage, system, tunnel, views
 from .alerts import Alerts
 from .tg import Bot, kb, reply_kb
 from .util import INTERACTIVE, RICH_LEN, CmdError, State, cut_html, esc, fmt_ago, fmt_bytes, p, tg_time
 
 log = logging.getLogger(__name__)
 
-BTN = {"status": "📊 Сервер", "tun": "🔐 Клиенты", "geo": "🌍 Доступность",
-       "report": "📋 Отчёт", "ctl": "⚙️ Управление"}
-COMMANDS = {"status": "status", "clients": "tun", "geo": "geo", "bans": "bans", "report": "report", "control": "ctl"}
+BTN = {"status": "📊 Сервер", "tun": "🔐 Клиенты", "geo": "🌍 Доступность", "ctl": "⚙️ Управление"}
+COMMANDS = {"status": "status", "clients": "tun", "geo": "geo", "bans": "bans", "control": "ctl"}
 
 
 def main_kb() -> dict:
-    """Клавиатура внизу чата. Кнопка клиентов — только если туннель на сервере найден."""
-    top = [BTN["status"]] + ([BTN["tun"]] if tunnel.found() else []) + [BTN["geo"]]
-    return reply_kb(top, [BTN["report"], BTN["ctl"]])
+    """Клавиатура внизу чата, по две кнопки в ряд (три в ряд на телефоне обрезаются).
+    Кнопка клиентов — только если туннель на сервере найден."""
+    names = [BTN["status"]] + ([BTN["tun"]] if tunnel.found() else []) + [BTN["geo"], BTN["ctl"]]
+    return reply_kb(*[names[i:i + 2] for i in range(0, len(names), 2)])
 
 
 def bot_commands() -> list[tuple[str, str]]:
     cmds = [("status", "Сервер: нагрузка, службы, порты"), ("clients", "Клиенты туннеля"),
-            ("geo", "Доступность из разных стран"), ("bans", "fail2ban"), ("report", "Отчёт"),
+            ("geo", "Доступность из разных стран"), ("bans", "fail2ban"),
             ("control", "Управление"), ("menu", "Показать кнопки")]
     return [c for c in cmds if c[0] != "clients" or tunnel.found()]
 
@@ -49,7 +49,7 @@ ACTIONS = {
 # Долгие разделы: сначала показываем «⏳», потом подменяем результатом
 SLOW = {"geo": views.GEO_WAIT}
 # Разделы в rich-формате (заголовки, таблицы, сворачиваемые блоки); остальное — обычные сообщения
-RICH = {"status", "tun", "geo", "bans", "report"}
+RICH = {"status", "tun", "geo", "bans"}
 MAX_LEN = 4000
 
 
@@ -102,14 +102,13 @@ class Handlers:
         if view == "status":
             return await views.status(), kb([("⟳ Обновить", "v:status"), ("🛡 Баны", "v:bans")])
         if view == "tun":
-            text = await views.tunnel_view(pool=self.bot.pool, emojis=self.state.data.get("tunnel_emoji"))
+            text = await views.tunnel_view(emojis=self.state.data.get("tunnel_emoji"),
+                                          traffic=self.state.data.get("traffic"))
             return text, refresh_kb(view)
         if view == "geo":
             return await views.geo_view(self.bot.pool, self.state.data), refresh_kb(view)
         if view == "bans":
             return await views.bans(), kb([("⟳ Обновить", "v:bans"), ("◀ Сервер", "v:status")])
-        if view == "report":
-            return (await report.build(self.state))[0], refresh_kb(view)
         if view == "ctl":
             return CTL_TEXT, CTL_KB
         if view == "upd":

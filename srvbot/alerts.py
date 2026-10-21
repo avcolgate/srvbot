@@ -35,6 +35,7 @@ class Alerts:
         self.peer_rx: dict[str, int] = {}      # ключ клиента -> принято байт на прошлой проверке
         self.online_prev: dict[str, int] = {}  # контейнер -> сколько клиентов было в сети на прошлой проверке
         self.mass_drop: set[str] = set()       # контейнеры, где все клиенты пропали разом
+        self.shared_prev: dict[str, bool] = {} # контейнер -> клиенты в сети выходили с одного адреса
         self.geo_nodes: dict = {}              # кэш узлов check-host для проверки из страны
 
     async def send(self, text: str, markup=None, reply_to: int | None = None, rich: bool = False) -> dict | None:
@@ -46,12 +47,13 @@ class Alerts:
             log.exception("send failed")
             return None
 
-    async def set(self, key: str, bad: bool, title: str, problem: str = "", sustain: int = 1, markup=None):
+    async def set(self, key: str, bad: bool, title: str, problem: str = "", sustain: int = 1, markup=None,
+                  icon: str = "🔴"):
         if bad:
             self.streak[key] = self.streak.get(key, 0) + 1
             # активным алерт становится только после успешной отправки — иначе повторим в следующий цикл
             if self.streak[key] >= sustain and key not in self.active:
-                if msg := await self.send(f"🔴 <b>{esc(title)}</b>: {esc(problem)}", markup):
+                if msg := await self.send(f"{icon} <b>{esc(title)}</b>: {esc(problem)}", markup):
                     self.active[key] = {"title": title, "mid": msg["message_id"], "since": time.time()}
                     self.state.save()
         else:
@@ -221,7 +223,7 @@ class Alerts:
                 await self.set(key, False, info.get("title", "клиент"))
             for k in [k for k in self.peer_rx if k not in current]:
                 del self.peer_rx[k]
-        await self.check_traffic(ok)
+        await self.check_traffic(ok, complete=bool(ok) and len(ok) == len(insts))
 
     async def check_blocking(self, inst: tunnel.Instance, emojis: dict[str, str], now: float):
         """Два ранних признака блокировки адреса: клиент шлёт пакеты без рукопожатия (сеть режет начало
@@ -237,24 +239,36 @@ class Alerts:
         online = sum(tunnel.is_online(p, now) for p in inst.peers)
         prev = self.online_prev.get(inst.container, 0)
         self.online_prev[inst.container] = online
+        shared = self.shared_prev.get(inst.container, False)
+        if online:
+            self.shared_prev[inst.container] = tunnel.shared_network(inst.peers, now)
         if tunnel.mass_drop(prev, online):
             self.mass_drop.add(inst.container)
         elif online:
             self.mass_drop.discard(inst.container)
+        if shared:
+            problem, icon = (f"все {prev} клиентов пропали одновременно, но все они были за одним адресом — "
+                             f"скорее пропала сеть у них, а не блокировка сервера"), "🟡"
+        else:
+            problem, icon = f"все {prev} клиентов пропали одновременно — похоже на блокировку адреса сервера", "🔴"
         await self.set(f"drop:{inst.container}", inst.container in self.mass_drop, f"клиенты {inst.container}",
-                       f"все {prev} клиентов пропали одновременно — похоже на блокировку адреса сервера",
-                       markup=links)
+                       problem, markup=links, icon=icon)
         if inst.container in self.mass_drop and prev and config.GEO_COUNTRY:
             try:  # внеочередная проверка из страны — её алерт придёт следом
                 await self.check_geo(self.geo_nodes)
             except Exception:
                 log.exception("check geo after mass drop failed")
 
-    async def check_traffic(self, insts: list[tunnel.Instance]):
-        """Объём трафика повышает риск блокировки адреса — раз в день предупреждаем о превышении порога."""
-        today = datetime.now(config.TZ).date().isoformat()
-        day, rx, tx = report.day_traffic(self.state.data.get("traffic_day"), insts, today)
-        self.state["traffic_day"] = day
+    async def check_traffic(self, insts: list[tunnel.Instance], complete: bool = False):
+        """Учёт трафика клиентов (сохраняется со следующим сохранением состояния — в пределах минуты).
+        Объём трафика повышает риск блокировки адреса — раз в день предупреждаем о превышении порога."""
+        now = datetime.now(config.TZ)
+        today = now.date().isoformat()
+        led = report.account(self.state.data.get("traffic"), insts, now.timestamp(), complete)
+        self.state["traffic"] = led
+        self.state.data.pop("traffic_day", None)  # прежний учёт «за сегодня» от счётчиков туннеля
+        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        rx, tx = report.total_since(led, midnight)
         if rx + tx >= config.TRAFFIC_DAY_GB * 2**30 and self.state.data.get("traffic_warned") != today:
             if await self.send(f"📈 <b>Трафик за сегодня</b> уже {fmt_bytes(rx + tx)} (↓{fmt_bytes(tx)} ↑{fmt_bytes(rx)}): "
                                f"объём трафика повышает риск блокировки адреса",

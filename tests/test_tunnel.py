@@ -182,6 +182,16 @@ class BlockingSigns(unittest.TestCase):
         self.assertFalse(tunnel.mass_drop(2, 1))
         self.assertFalse(tunnel.mass_drop(0, 0))
 
+    def test_shared_network(self):
+        fresh = int(self.NOW) - 30
+        mk = lambda ep, hs=fresh: tunnel.Peer("K", ep, "10.0.0.5/32", hs, 0, 0)
+        self.assertTrue(tunnel.shared_network([mk("1.2.3.4:1500"), mk("1.2.3.4:1600")], self.NOW))
+        self.assertFalse(tunnel.shared_network([mk("1.2.3.4:1500"), mk("5.6.7.8:1500")], self.NOW))
+        self.assertFalse(tunnel.shared_network([mk("1.2.3.4:1500")], self.NOW))
+        self.assertFalse(tunnel.shared_network([mk("1.2.3.4:1500"), mk(None)], self.NOW))
+        # офлайн-клиент с другим адресом не мешает: смотрим только тех, кто в сети
+        self.assertTrue(tunnel.shared_network([mk("1.2.3.4:1500"), mk("1.2.3.4:1600"), mk("5.6.7.8:1", 0)], self.NOW))
+
 
 if __name__ == "__main__":
     unittest.main()
