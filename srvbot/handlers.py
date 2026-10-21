@@ -9,7 +9,7 @@ from datetime import datetime
 
 from . import config, docker, history, manage, system, tunnel, views
 from .alerts import Alerts
-from .tg import Bot, kb, reply_kb
+from .tg import Bot, TGError, kb, reply_kb
 from .util import INTERACTIVE, RICH_LEN, CmdError, State, cut_html, esc, fmt_ago, fmt_bytes, p, tg_time
 
 log = logging.getLogger(__name__)
@@ -116,6 +116,10 @@ class Handlers:
         self.bot, self.state, self.alerts = bot, state, alerts
         # Подтверждения опасных действий: token -> [описание, kind, arg, срок (0 — ещё не спрашивали)]
         self.pending: dict[str, list] = {}
+        # Нажатия, которые ещё выполняются: повтор той же кнопки (или того же раздела) не ставим в очередь —
+        # иначе при медленном сервере нетерпеливые нажатия копятся и ответ на последнее ждёт минуту
+        self.busy: set[tuple] = set()
+        self.chart_lock = asyncio.Lock()  # картинки — по одной: каждая на время рисования берёт ~100 МБ
 
     async def __call__(self, update: dict):
         INTERACTIVE.set(True)  # свой слот и короткий таймаут для внешних команд (см. util.run)
@@ -123,11 +127,29 @@ class Handlers:
         if msg := update.get("message"):
             if msg.get("from", {}).get("id") == config.OWNER_ID and msg.get("chat", {}).get("id") == config.OWNER_ID \
                     and "text" in msg:
-                await self.logged(describe_text(msg["text"]), self.on_message(msg))
+                key = ("msg", msg["text"].strip())
+                if key in self.busy:
+                    log.info("%s — повтор, ещё выполняется", describe_text(msg["text"]))
+                    await self.bot.delete(msg["chat"]["id"], msg["message_id"])
+                    return
+                self.busy.add(key)
+                try:
+                    await self.logged(describe_text(msg["text"]), self.on_message(msg))
+                finally:
+                    self.busy.discard(key)
         elif cq := update.get("callback_query"):
             if cq.get("from", {}).get("id") == config.OWNER_ID \
                     and cq.get("message", {}).get("chat", {}).get("id") == config.OWNER_ID:
-                await self.logged(describe_data(cq.get("data", "")), self.on_callback(cq))
+                key = ("cb", cq["message"].get("message_id"), cq.get("data", ""))
+                if key in self.busy:
+                    log.info("%s — повтор, ещё выполняется", describe_data(cq.get("data", "")))
+                    await self.bot.answer(cq["id"], "уже выполняю…")
+                    return
+                self.busy.add(key)
+                try:
+                    await self.logged(describe_data(cq.get("data", "")), self.on_callback(cq))
+                finally:
+                    self.busy.discard(key)
 
     @staticmethod
     async def logged(what: str, coro):
@@ -240,9 +262,11 @@ class Handlers:
         cpu = await system.cpu_now(0.2)  # обычно — готовое значение фонового замера
         m = system.metrics(cpu)
         try:
-            jpeg = await asyncio.get_running_loop().run_in_executor(
-                self.bot.pool, chart.render, self.state.data.get("metrics"),
-                (self.state.data.get("traffic") or {}).get("series"), time.time(), cpu, 100 - m.mem_avail_pct, days)
+            async with self.chart_lock:
+                jpeg = await asyncio.get_running_loop().run_in_executor(
+                    self.bot.pool, chart.render, self.state.data.get("metrics"),
+                    (self.state.data.get("traffic") or {}).get("series"), time.time(), cpu, 100 - m.mem_avail_pct,
+                    days)
         except chart.ChartError as e:
             await self.bot.send(chat, f"🔴 График не нарисовался: {esc(e)}")
             return
@@ -309,7 +333,12 @@ class Handlers:
                 await self.bot.edit(chat, mid, SLOW[arg])
             text, markup = await self.render(arg)
             rich = arg in RICH
-            await self.bot.edit(chat, mid, cut(text, rich), markup, rich=rich)
+            try:
+                await self.bot.edit(chat, mid, cut(text, rich), markup, rich=rich)
+            except TGError as e:  # сообщение удалено или слишком старое — ответим новым, а не молчанием
+                log.info("правка не удалась (%s), отправляю раздел заново", e)
+                sent = await self.bot.send(chat, cut(text, rich), markup, rich=rich)
+                await self.replace_view(chat, sent["message_id"])
         elif kind == "go":
             await self.on_ask(cq, chat, mid, *arg.partition(":")[::2])
         # Кнопки под алертами: результат — новым сообщением, сам алерт остаётся в чате
@@ -347,7 +376,7 @@ class Handlers:
         elif kind == "chart":
             await self.bot.answer(cq["id"], "рисую…")
             # из раздела «Сервер» — новой картинкой за сутки; с кнопок под картинкой — перерисовка на месте
-            await self.send_chart(chat, int(arg) if arg else 1, mid if arg else None)
+            await self.send_chart(chat, int(arg) if arg.isdigit() else 1, mid if arg else None)
         elif kind == "ub":
             jail, _, ip = arg.partition(":")
             try:

@@ -67,11 +67,17 @@ def api_call(token: str, method: str, params: dict, timeout: float = 30, files: 
             resp = conn.getresponse()
             data = json.loads(resp.read() or b"{}")
         except (OSError, http.client.HTTPException, ValueError) as e:
+            if attempt == 0 and method != "getUpdates":  # обрыв сети — один повтор через секунду
+                time.sleep(1)
+                continue
             raise TGError(f"{method}: {type(e).__name__}: {e}") from None
         finally:
             conn.close()
         if data.get("ok"):
             return data.get("result")
+        if resp.status >= 500 and attempt == 0:  # временный сбой на стороне Telegram — тоже повтор
+            time.sleep(1)
+            continue
         retry = (data.get("parameters") or {}).get("retry_after")
         if resp.status == 429 and retry and attempt == 0:
             time.sleep(retry)

@@ -58,3 +58,24 @@ class History(unittest.TestCase):
             text = history.view(st)
             self.assertIn("🔴 очистить диск · нет места &lt;x&gt; · 1 мин", text)
             self.assertIn(f"последние {history.SHOW}", text)
+
+
+class ContainerHistory(unittest.TestCase):
+    def test_state_and_bot_journal_instead_of_disabled_logs(self):
+        import asyncio
+        from unittest import mock
+        from srvbot.util import CmdError
+
+        async def fake_run(*args, **kw):
+            if args[:2] == ("docker", "logs"):
+                raise CmdError("docker logs: configured logging driver does not support reading")
+            if args[:2] == ("docker", "inspect"):
+                return "exited|2026-10-21T08:08:34.98Z|3|always|true|137\n"
+            return ("1792573200.1 host python3[5]: WARNING srvbot.alerts: уведомление: 🔴 контейнер box: упал\n"
+                    "1792573260.1 host python3[5]: INFO srvbot.handlers: журнал box — 0.2 с\n")
+        with mock.patch.object(manage, "run", fake_run):
+            out = asyncio.run(manage.container_logs("box"))
+        self.assertIn("остановлен, запущен", out)
+        self.assertIn("перезапусков 3 (политика always), последний раз убит из-за нехватки памяти, последний код выхода 137", out)
+        self.assertIn("уведомление: 🔴 контейнер box: упал", out)
+        self.assertNotIn("журнал box", out)  # нажатия кнопок — не история контейнера

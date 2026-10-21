@@ -22,65 +22,74 @@ def _gauge(pct: float, note: str = "") -> str:
 async def status() -> tuple[str, int]:
     """Текст раздела и сколько адресов забанено сейчас — для счётчика на кнопке «Баны»."""
     m = system.metrics(await system.cpu_now())
-    rows = [["CPU", _gauge(m.cpu_pct)],
-            ["RAM", _gauge(100 - m.mem_avail_pct, f"доступно {fmt_bytes(m.mem_avail)}")]]
-    if m.swap_total:
-        rows.append(["swap", _gauge(m.swap_used / m.swap_total * 100,
-                                    f"{fmt_bytes(m.swap_used)} из {fmt_bytes(m.swap_total)}")])
-    rows.append(["диск", _gauge(m.disk_pct, f"свободно {fmt_bytes(m.disk_free)}")])
-    blocks = [h("📊 Сервер"),
-              p(f"⏱ аптайм {fmt_duration(m.uptime)}, load {m.load[0]:.2f} / {m.load[1]:.2f} / {m.load[2]:.2f}",
-                f"🌐 IP {esc(', '.join(system.public_ipv4()) or 'нет внешнего IPv4')}"),
-              table(rows)]
-    # службы и контейнеры — с кнопками перезапуска и журнала прямо в строке;
-    # каждая внешняя команда в своём try: зависшая одна не должна ронять весь раздел
-    svc = []
+    # раздел должен помещаться на экран телефона: ресурсы — по строке, полоска и процент
+    rows = [["CPU", _gauge(m.cpu_pct)], ["RAM", _gauge(100 - m.mem_avail_pct)]]
+    if m.swap_total:  # swap важен: на маленьком сервере он первым показывает, что памяти не хватает
+        rows.append(["swap", _gauge(m.swap_used / m.swap_total * 100)])
+    rows.append(["диск", _gauge(m.disk_pct)])
+    blocks = [h("📊 Сервер"), table(rows),
+              p(f"<i>⏱ {fmt_duration(m.uptime)} · load {m.load[0]:.2f} · "
+                f"🌐 {esc(', '.join(system.public_ipv4()) or 'нет внешнего IPv4')}</i>")]
+    # Всё остальное — в одном свёрнутом блоке, иначе раздел не помещается на экран телефона. В заголовке
+    # блока — итог («всё работает» или что сломано), при проблеме блок открыт. Кнопки перезапуска и журнала —
+    # прямо в строках. Каждая внешняя команда в своём try: зависшая одна не должна ронять весь раздел.
+    inner, trouble = [], []
     try:
         states = await manage.unit_states()
         for u in manage.SERVICES:
             st = states.get(u, "?")
+            down = st not in ("active", "activating", "reloading")
             line = f"{unit_icon(st)} {u}"
             if u in manage.RESTARTABLE:
                 line += f" {btn('🔄', f'go:unit:{u}')}"
-            svc.append(mark(line, st not in ("active", "activating", "reloading")) + f" {btn('📜', f'lg:u:{u}')}")
+            inner.append(mark(line, down) + f" {btn('📜', f'lg:u:{u}')}")
+            if down:
+                trouble.append(u)
     except CmdError as e:
-        svc.append(f"🔴 службы: {esc(e)}")
-    jails = await system.jails()
-    svc.append("🛡 fail2ban: " + (" · ".join(f"{esc(j.name)} сейчас {len(j.banned_now)}" for j in jails)
-                                  if jails else "не отвечает"))
-    upd, sec = system.updates()
-    if upd:
-        svc.append(f"📦 обновлений: {upd}" + (f" (безопасности {sec})" if sec else ""))
-    blocks += [h("🔧 Службы", 4), p(*svc)]
-    ctr_lines = []
+        inner.append(f"🔴 службы: {esc(e)}")
+        trouble.append("службы не ответили")
     try:
         ctrs = await docker.containers()
     except CmdError as e:  # docker завис (например, сервер перегружен) — показываем, что знали до этого
-        ctr_lines.append(f"🔴 docker не отвечает: {esc(e)}")
+        inner.append(f"🔴 docker не отвечает: {esc(e)}")
+        trouble.append("docker не отвечает")
         ctrs = []
         if last := docker.cached():
-            ctr_lines.append(f"<i>по данным {tg_time(last[0])}:</i>")
+            inner.append(f"<i>по данным {tg_time(last[0])}:</i>")
             ctrs = last[1]
     for c in ctrs:
-        line = f"{'🟢' if c.running else ('🔴' if c.watched else '⚪')} {esc(c.name)} — {esc(c.status)}"
-        ctr_lines.append(mark(line, c.watched and not c.running)
-                         + (f" {btn('🔄', f'go:restart:{c.name}')}" if c.watched else "")
-                         + f" {btn('📜', f'lg:c:{c.name}')}")
-    blocks += [h("🐳 Контейнеры", 4), p(*(ctr_lines or ["нет контейнеров"]))]
+        # статус — только если не работает: «running» и так видно по 🟢, а строка на телефоне переносилась
+        line = f"{'🟢' if c.running else ('🔴' if c.watched else '⚪')} 🐳 {esc(c.name)}" \
+            + ("" if c.running else f" — {esc(c.status)}")
+        inner.append(mark(line, c.watched and not c.running)
+                     + (f" {btn('🔄', f'go:restart:{c.name}')}" if c.watched else "")
+                     + f" {btn('📜', f'lg:c:{c.name}')}")
+        if c.watched and not c.running:
+            trouble.append(c.name)
+    jails = await system.jails()
+    inner.append("🛡 fail2ban: " + (" · ".join(f"{esc(j.name)} сейчас {len(j.banned_now)}" for j in jails)
+                                    if jails else "не отвечает"))
+    upd, sec = system.updates()
+    if upd:
+        inner.append(f"📦 обновлений: {upd}" + (f" (безопасности {sec})" if sec else ""))
     ports, stale = system.listening()
     if ports:
         by_proc: dict[str, list[str]] = {}
         for port, proc in sorted(ports.items(), key=lambda kv: int(kv[0].split("/")[1])):
             by_proc.setdefault(proc, []).append(port)
-        blocks.append(details("🔌 Порты", p(*[f"{esc(proc)}: {', '.join(ps)}" for proc, ps in by_proc.items()])))
-    if stale:
-        blocks.append(p(*[mark(f"🔴 {esc(port)} привязан к {esc(ip)} — этого адреса больше нет на сервере")
-                          for port, ip in stale.items()]))
-    certs = await system.certs()
-    if certs:
-        blocks.append(details("🔒 Сертификаты", p(*[
-            mark(f"{'🟢' if c.days_left >= config.CERT_WARN_DAYS else '🔴'} {esc(c.name)}: {c.days_left} дн.",
-                 c.days_left < config.CERT_WARN_DAYS) for c in certs])))
+        inner.append("🔌 " + " · ".join(f"{esc(proc)} {', '.join(ps)}" for proc, ps in by_proc.items()))
+    for port, ip in stale.items():
+        inner.append(mark(f"🔴 {esc(port)} привязан к {esc(ip)} — этого адреса больше нет на сервере"))
+        trouble.append(f"порт {port}")
+    for c in await system.certs():
+        expiring = c.days_left < config.CERT_WARN_DAYS
+        inner.append(mark(f"{'🔴' if expiring else '🟢'} 🔒 {esc(c.name)}: {c.days_left} дн.", expiring))
+        if expiring:
+            trouble.append(f"сертификат {c.name}")
+    summary = ("🔧 Службы: 🔴 " + ", ".join(esc(t) for t in trouble[:3])
+               + (f" и ещё {len(trouble) - 3}" if len(trouble) > 3 else "")) if trouble \
+        else "🔧 Службы: всё работает"
+    blocks.append(details(summary, p(*inner), open_=bool(trouble)))
     if system.reboot_required():
         blocks.append(p(mark("⚠️ требуется перезагрузка")))
     return "".join(blocks), sum(len(j.banned_now) for j in jails)

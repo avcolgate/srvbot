@@ -2,12 +2,15 @@ import asyncio
 import contextvars
 import html
 import json
+import logging
 import os
 import re
 import time
 from datetime import datetime
 
 from . import config
+
+log = logging.getLogger(__name__)
 
 
 class CmdError(Exception):
@@ -22,9 +25,29 @@ _ui_slot = asyncio.Semaphore(1)
 INTERACTIVE = contextvars.ContextVar("interactive", default=False)  # True внутри обработки апдейта
 
 
+_hung: dict[str, float] = {}  # команда -> когда она последний раз не уложилась в таймаут
+HUNG_SKIP = 60                 # столько секунд команды из чата её не ждут
+
+
 async def run(*args: str, **kw) -> str:
-    async with (_ui_slot if INTERACTIVE.get() else _cmd_slots):
-        return await _run(*args, **kw)
+    """Внешняя команда. Если она недавно зависала, из чата её не ждём: в разделе несколько таких команд,
+    и таймауты складывались бы в минуту ожидания. Фоновые проверки пробуют всегда — по ним видно, ожила ли."""
+    tool, interactive = args[0], INTERACTIVE.get()
+
+    def skip():  # проверяем и до очереди, и после: пока стояли в очереди, команда могла зависнуть у соседа
+        if interactive and tool in _hung and time.monotonic() - _hung[tool] < HUNG_SKIP:
+            raise CmdError(f"{tool}: не ответил {time.monotonic() - _hung[tool]:.0f} с назад, не жду")
+    skip()
+    async with (_ui_slot if interactive else _cmd_slots):
+        skip()
+        try:
+            out = await _run(*args, **kw)
+        except CmdError as e:
+            if "таймаут" in str(e):
+                _hung[tool] = time.monotonic()
+            raise
+    _hung.pop(tool, None)
+    return out
 
 
 async def _run(*args: str, timeout: float | None = None, check: bool = True, merge: bool = False) -> str:
@@ -83,6 +106,16 @@ def esc(s) -> str:
     return html.escape(str(s), quote=False)
 
 
+# Ожидаемые типы полей состояния: поле не того типа (файл испорчен руками или сбоем) отбрасываем —
+# иначе бот падал бы на старте или в разделах. Числа: int и float взаимозаменяемы.
+STATE_TYPES = {
+    "active": dict, "containers": list, "ports": dict, "tunnel_peers": dict, "tunnel_emoji": dict,
+    "traffic": dict, "metrics": list, "history": list, "snap": dict, "geo_last": dict, "geo_hist": list,
+    "public_ips": list, "upgrade": dict, "f2b_daily": dict, "last_seen": (int, float), "ip_since": (int, float),
+    "view_msg": int, "clean_exit": bool, "last_weekly": str, "last_daily": str, "traffic_warned": str,
+}
+
+
 class State:
     """Персистентное состояние бота (JSON)."""
 
@@ -93,6 +126,13 @@ class State:
                 self.data = json.load(f)
         except (FileNotFoundError, ValueError):  # ValueError — в т.ч. битый JSON и битый UTF-8
             self.data = {}
+        if not isinstance(self.data, dict):
+            log.warning("состояние %s — не объект JSON, начинаю с пустого", path)
+            self.data = {}
+        for key, kind in STATE_TYPES.items():
+            if key in self.data and not isinstance(self.data[key], kind):
+                log.warning("состояние: поле %s не того типа (%s), отбрасываю", key, type(self.data[key]).__name__)
+                del self.data[key]
 
     def get(self, key, default=None):
         return self.data.setdefault(key, default)

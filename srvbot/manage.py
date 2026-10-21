@@ -4,11 +4,14 @@ import json
 import os
 import re
 import shutil
+import time
 from collections import Counter
+from datetime import datetime
 
 import psutil
 
-from .util import CmdError, run
+from . import config
+from .util import CmdError, fmt_duration, run
 
 # --- обновления ---
 
@@ -125,8 +128,34 @@ async def container_logs(name: str, n: int = 25) -> str:
         return await run("docker", "logs", "--tail", str(n), name, merge=True)
     except CmdError as e:
         if "does not support reading" in str(e):
-            return "журнал у этого контейнера отключён (log driver none в его настройках)"
+            return await container_history(name, n)
         raise
+
+
+async def container_history(name: str, n: int = 25) -> str:
+    """Вместо журнала контейнера, у которого логи отключены (log driver none — так задумано, чтобы не копить
+    следы подключений): его состояние из docker inspect и что о нём за неделю записал сам бот — алерты,
+    кто из клиентов подключался и отключался."""
+    fmt = ("{{.State.Status}}|{{.State.StartedAt}}|{{.RestartCount}}|{{.HostConfig.RestartPolicy.Name}}|"
+           "{{.State.OOMKilled}}|{{.State.ExitCode}}")
+    status, started, restarts, policy, oom, code = (await run("docker", "inspect", "--format", fmt, name)).strip().split("|")
+    when = datetime.fromisoformat(started[:19] + "+00:00")
+    status = {"running": "работает", "exited": "остановлен", "restarting": "перезапускается",
+              "paused": "на паузе", "created": "создан, не запущен", "dead": "мёртв"}.get(status, status)
+    head = ["журнал контейнера отключён (log driver none), вместо него:",
+            f"{status}, запущен {when.astimezone(config.TZ):%d.%m %H:%M} "
+            f"({fmt_duration(time.time() - when.timestamp())} назад)",
+            f"перезапусков {restarts} (политика {policy})"
+            + (", последний раз убит из-за нехватки памяти" if oom == "true" else "")
+            + (f", последний код выхода {code}" if code not in ("0", "") else "")]
+    out = await run("journalctl", "-u", "srvbot", "--since", "-7d", "--no-pager", "-o", "short-unix",
+                    "--grep", re.escape(name), check=False, timeout=15)
+    own = []  # время — в часовом поясе бота, как и всё остальное в сообщениях
+    for line in out.splitlines():
+        m = re.match(r"(\d+)\.\d+ \S+ python3\[\d+\]: (?:INFO |WARNING )?srvbot\.(\w+): (.*)", line)
+        if m and m.group(2) != "handlers":
+            own.append(f"{datetime.fromtimestamp(int(m.group(1)), config.TZ):%d.%m %H:%M} {m.group(3)}")
+    return "\n".join(head + ["", "из журнала бота за неделю:"] + (own[-n:] or ["записей нет"]))
 
 
 # --- сводки журналов за сутки (раздел 📜 Журналы) ---
