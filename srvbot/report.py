@@ -15,17 +15,27 @@ def delta(cur: int, prev: int | None) -> int:
 
 
 HOUR = 3600
-KEEP_HOURS = 48  # почасовые суммы храним за двое суток: хватает и на «24 ч», и на «сегодня»
+KEEP_HOURS = 48  # почасовые суммы по клиентам храним за двое суток: хватает и на «24 ч», и на «сегодня»
+SERIES_HOURS = 31 * 24  # общий трафик всех клиентов по часам — за месяц, для картинки
 
 
 def account(led: dict | None, insts: list[tunnel.Instance], now: float, complete: bool = False) -> dict:
     """Накопительный учёт трафика клиентов. Счётчики туннеля обнуляются при его перезапуске, поэтому
     прирост между проверками копится в состоянии бота и переживает перезапуски туннеля и бота.
     led = {"since": начало учёта, "total": [rx, tx], "peers": {"контейнер/ключ":
-           {"last": [rx, tx] — счётчики на прошлой проверке, "total": [rx, tx], "hours": [[начало часа, rx, tx], …]}}}
+           {"last": [rx, tx] — счётчики на прошлой проверке, "total": [rx, tx], "hours": [[начало часа, rx, tx], …]}},
+           "series": [[начало часа, rx, tx], …] — сумма по всем клиентам за месяц}
     complete — прочитаны все контейнеры: удалённых клиентов можно забыть (общий итог их трафик сохраняет)."""
     led = led or {"since": now, "total": [0, 0], "peers": {}}
     hour = int(now // HOUR * HOUR)
+    if "series" not in led:  # учёт старше этого поля: собираем ряд из почасовых сумм клиентов
+        by_hour: dict[int, list[int]] = {}
+        for rec in led["peers"].values():
+            for h, rx, tx in rec["hours"]:
+                cur = by_hour.setdefault(h, [0, 0])
+                cur[0], cur[1] = cur[0] + rx, cur[1] + tx
+        led["series"] = [[h, *v] for h, v in sorted(by_hour.items())]
+    series = led["series"]
     seen = set()
     for i in insts:
         if i.error:
@@ -41,6 +51,11 @@ def account(led: dict | None, insts: list[tunnel.Instance], now: float, complete
                 continue
             rec["total"] = [rec["total"][0] + drx, rec["total"][1] + dtx]
             led["total"] = [led["total"][0] + drx, led["total"][1] + dtx]
+            if series and series[-1][0] == hour:
+                series[-1][1] += drx
+                series[-1][2] += dtx
+            else:
+                series.append([hour, drx, dtx])
             if rec["hours"] and rec["hours"][-1][0] == hour:
                 rec["hours"][-1][1] += drx
                 rec["hours"][-1][2] += dtx
@@ -49,6 +64,7 @@ def account(led: dict | None, insts: list[tunnel.Instance], now: float, complete
             rec["hours"] = [x for x in rec["hours"] if x[0] > hour - KEEP_HOURS * HOUR]
     if complete:
         led["peers"] = {k: v for k, v in led["peers"].items() if k in seen}
+    led["series"] = [x for x in series if x[0] > hour - SERIES_HOURS * HOUR]
     return led
 
 

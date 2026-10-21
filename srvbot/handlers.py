@@ -33,9 +33,19 @@ def bot_commands() -> list[tuple[str, str]]:
 
 
 CTL_TEXT = "<b>⚙️ Управление</b>\nВыберите раздел. Любое действие выполняется только после подтверждения."
-CTL_KB = kb([("📦 Обновления", "v:upd"), ("🧹 Очистка диска", "v:clean")],
-            [("🗒 История", "v:hist"), ("📜 Журналы", "v:logs")],
-            [("⏻ Перезагрузить сервер", "go:reboot:")])
+def ctl_kb() -> dict:
+    """Клавиатура «Управления» с индикаторами: сколько обновлений ждёт, заполнен ли диск, нужна ли
+    перезагрузка. Кнопка, которая сейчас требует внимания, — синяя. Всё читается из файлов, без команд."""
+    upd, _ = system.updates()
+    disk = shutil.disk_usage("/")
+    disk_pct = disk.used / disk.total * 100
+    reboot = system.reboot_required()
+    attn = lambda on: ["primary"] if on else []
+    return kb([("📦 Обновления" + (f" · {upd}" if upd else ""), "v:upd", *attn(upd)),
+               ("🧹 Очистка диска" + (f" · {disk_pct:.0f}%" if disk_pct >= config.DISK_PCT - 10 else ""), "v:clean",
+                *attn(disk_pct >= config.DISK_PCT - 10))],
+              [("🗒 История", "v:hist"), ("📜 Журналы", "v:logs")],
+              [("⏻ Перезагрузить сервер" + (" · нужно" if reboot else ""), "go:reboot:", *attn(reboot))])
 
 # Действия с подтверждением: kind -> arg -> (что сделать, предупреждение, куда вернуться)
 ACTIONS = {
@@ -48,11 +58,12 @@ ACTIONS = {
 }
 
 # Долгие разделы: сначала показываем «⏳», потом подменяем результатом
-SLOW = {"geo": views.GEO_WAIT}
+SLOW = {"geow": views.GEO_WAIT}
 # Разделы в rich-формате (заголовки, таблицы, сворачиваемые блоки); остальное — обычные сообщения
-RICH = {"status", "tun", "geo", "bans", "logs"}
+RICH = {"status", "tun", "geo", "geow", "bans", "logs"}
 # Названия разделов для журнала службы
-VIEW_NAMES = {"status": "Сервер", "tun": "Клиенты", "geo": "Доступность", "bans": "Баны", "ctl": "Управление",
+VIEW_NAMES = {"status": "Сервер", "tun": "Клиенты", "geo": "Доступность", "geow": "Доступность по миру",
+              "bans": "Баны", "ctl": "Управление",
               "upd": "Обновления", "clean": "Очистка диска", "hist": "История", "logs": "Журналы"}
 MAX_LEN = 4000
 
@@ -95,7 +106,8 @@ def describe_data(data: str) -> str:
     if kind == "ub":
         jail, _, ip = arg.partition(":")
         return f"разбан {ip} в {jail}"
-    return {"x": "отмена", "aptu": "проверка обновлений (apt update)", "fg": f"не следить: {arg[:40]}"}.get(
+    return {"x": "отмена", "aptu": "проверка обновлений (apt update)", "chart": f"картинка «Сервер» за {arg or 1} дн.",
+            "fg": f"не следить: {arg[:40]}"}.get(
         kind, f"кнопка {data[:40]!r}")
 
 
@@ -139,17 +151,23 @@ class Handlers:
 
     async def _render(self, view: str) -> tuple[str, dict | None]:
         if view == "status":
-            return await views.status(), kb([("⟳ Обновить", "v:status"), ("🛡 Баны", "v:bans")])
+            text, banned = await views.status()
+            return text, kb([("⟳ Обновить", "v:status"), ("📈 За сутки", "chart:")],
+                            [("🛡 Баны" + (f" · {banned}" if banned else ""), "v:bans")])
         if view == "tun":
             text = await views.tunnel_view(emojis=self.state.data.get("tunnel_emoji"),
                                           traffic=self.state.data.get("traffic"))
             return text, refresh_kb(view)
-        if view == "geo":
-            return await views.geo_view(self.bot.pool, self.state.data), refresh_kb(view)
+        if view == "geo":  # мгновенно — из состояния; проверка по миру долгая, только по кнопке
+            return (await views.geo_view(self.bot.pool, self.state.data, world=False),
+                    kb([("⟳ Обновить", "v:geo"), ("🌍 Проверить по миру", "v:geow")]))
+        if view == "geow":
+            return (await views.geo_view(self.bot.pool, self.state.data),
+                    kb([("⟳ Проверить заново", "v:geow"), ("◀ Кратко", "v:geo")]))
         if view == "bans":
             return await views.bans(), kb([("⟳ Обновить", "v:bans"), ("◀ Сервер", "v:status")])
         if view == "ctl":
-            return CTL_TEXT, CTL_KB
+            return CTL_TEXT, ctl_kb()
         if view == "upd":
             return await self.updates_view()
         if view == "clean":
@@ -180,7 +198,7 @@ class Handlers:
             lines.append(f"<i>списки пакетов проверялись {fmt_ago(ts)}</i>")
         except OSError:
             pass
-        row = [("🔍 Проверить заново", "aptu:")] + ([("✅ Установить", "go:upgrade:")] if pkgs else [])
+        row = [("🔍 Проверить заново", "aptu:")] + ([("✅ Установить", "go:upgrade:", "success")] if pkgs else [])
         return "\n".join(lines), kb(row, back)
 
     async def clean_view(self) -> tuple[str, dict]:
@@ -193,7 +211,7 @@ class Handlers:
         lines += [f"• {names[k]} — {fmt_bytes(v)}" for k, v in est.items()]
         lines.append("• ненужные пакеты (apt autoremove) — сколько найдётся")
         lines.append(f"\n<i>всего ~{fmt_bytes(sum(est.values()))}; данные контейнеров и настройки не трогаются</i>")
-        return "\n".join(lines), kb([("🧹 Очистить", "go:clean:")], [("◀ Управление", "v:ctl")])
+        return "\n".join(lines), kb([("🧹 Очистить", "go:clean:", "success")], [("◀ Управление", "v:ctl")])
 
     async def logs_view(self, what: str, name: str) -> tuple[str, dict]:
         try:
@@ -212,6 +230,28 @@ class Handlers:
             size += len(line) + 1
         text = f"<b>📜 {esc(name)}</b> — последние строки\n<pre>" + "\n".join(reversed(kept)) + "</pre>"
         return stamp(text), kb([("⟳ Обновить", f"lg:{what}:{name}"), ("◀ Сервер", "v:status")])
+
+    async def send_chart(self, chat: int, days: int, mid: int | None = None):
+        """Картинка «Сервер» за days дней: новым сообщением или (mid) заменой картинки на месте.
+        Под ней — переключатель периода, текущий подсвечен."""
+        from . import chart  # Pillow грузится только при рисовании
+        if days not in chart.PERIODS:
+            return
+        cpu = await system.cpu_now(0.2)  # обычно — готовое значение фонового замера
+        m = system.metrics(cpu)
+        try:
+            jpeg = await asyncio.get_running_loop().run_in_executor(
+                self.bot.pool, chart.render, self.state.data.get("metrics"),
+                (self.state.data.get("traffic") or {}).get("series"), time.time(), cpu, 100 - m.mem_avail_pct, days)
+        except chart.ChartError as e:
+            await self.bot.send(chat, f"🔴 График не нарисовался: {esc(e)}")
+            return
+        markup = kb([(chart.PERIODS[d][0].capitalize(), f"chart:{d}", *(["primary"] if d == days else []))
+                     for d in chart.PERIODS], [("✖ Закрыть", "x:")])
+        if mid:
+            await self.bot.edit_photo(chat, mid, jpeg, markup)
+        else:
+            await self.bot.send_photo(chat, jpeg, markup=markup)
 
     def ask(self, kind: str, arg: str) -> str:
         """Регистрирует действие, ждущее подтверждения; токен живёт CONFIRM_TTL секунд."""
@@ -304,6 +344,10 @@ class Handlers:
             await self.bot.edit(chat, mid, cut(text), markup)
         elif kind == "do":
             await self.on_do(cq, chat, mid, arg)
+        elif kind == "chart":
+            await self.bot.answer(cq["id"], "рисую…")
+            # из раздела «Сервер» — новой картинкой за сутки; с кнопок под картинкой — перерисовка на месте
+            await self.send_chart(chat, int(arg) if arg else 1, mid if arg else None)
         elif kind == "ub":
             jail, _, ip = arg.partition(":")
             try:

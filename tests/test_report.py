@@ -52,6 +52,17 @@ class Ledger(unittest.TestCase):
         led = report.account(led, [inst("c", {"A": (500, 0)}, error="нет данных")], self.T + 60)
         self.assertEqual(led["total"], [100, 0])
 
+    def test_series_sums_all_clients_and_survives_removal(self):
+        led = report.account(None, [inst("c", {"A": (100, 0), "B": (5, 1)})], self.T)
+        led = report.account(led, [inst("c", {"A": (130, 0)})], self.T + 3600, complete=True)
+        self.assertEqual(led["series"], [[self.T, 105, 1], [self.T + 3600, 30, 0]])
+
+    def test_series_built_for_old_ledger(self):
+        led = report.account(None, [inst("c", {"A": (100, 7)})], self.T)
+        del led["series"]
+        led = report.account(led, [inst("c", {"A": (100, 7)})], self.T + 60)
+        self.assertEqual(led["series"], [[self.T, 100, 7]])
+
     def test_total_since_by_container(self):
         led = report.account(None, [inst("c", {"A": (1, 2)}), inst("d", {"A": (10, 20)})], self.T)
         self.assertEqual(report.total_since(led, self.T), (11, 22))

@@ -114,3 +114,20 @@ class CutRich(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ControlKeyboard(unittest.TestCase):
+    def kb(self, upd: int, reboot: bool) -> list[tuple[str, str]]:
+        with mock.patch.object(handlers.system, "updates", return_value=(upd, 0)), \
+                mock.patch.object(handlers.system, "reboot_required", return_value=reboot):
+            return [(b["text"], b.get("style", "")) for r in handlers.ctl_kb()["inline_keyboard"] for b in r]
+
+    def test_attention_is_blue_with_counter(self):
+        labels = dict(self.kb(6, True))
+        self.assertEqual(labels["📦 Обновления · 6"], "primary")
+        self.assertEqual(labels["⏻ Перезагрузить сервер · нужно"], "primary")
+
+    def test_calm_state_is_plain(self):
+        labels = dict(self.kb(0, False))
+        self.assertEqual(labels["📦 Обновления"], "")
+        self.assertEqual(labels["⏻ Перезагрузить сервер"], "")

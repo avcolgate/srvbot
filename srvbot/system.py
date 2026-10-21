@@ -60,7 +60,23 @@ class CpuMeter:
         return max(0.0, min(100.0, res))
 
 
+_cpu_recent: tuple[float, float] | None = None  # (когда, загрузка %) — из фонового замера
+
+
+async def sample_cpu(every: float = 5):
+    """Фоновый замер CPU раз в every секунд (это просто чтение /proc/stat): разделы и картинка берут
+    готовое значение и не ждут секунду замера."""
+    global _cpu_recent
+    m = CpuMeter()
+    while True:
+        await asyncio.sleep(every)
+        _cpu_recent = (time.monotonic(), m.pct())
+
+
 async def cpu_now(sec: float = 1.0) -> float:
+    """Загрузка CPU сейчас: из фонового замера, если он свежий, иначе — замер за sec секунд."""
+    if _cpu_recent and time.monotonic() - _cpu_recent[0] < 15:
+        return _cpu_recent[1]
     m = CpuMeter()
     await asyncio.sleep(sec)
     return m.pct()

@@ -5,7 +5,7 @@ import re
 import time
 from datetime import datetime
 
-from . import checkhost, config, docker, history, manage, report, system, tunnel
+from . import checkhost, config, docker, history, manage, report, system, trend, tunnel
 from .tg import Bot, kb
 from .util import RICH_LEN, CmdError, State, cut_html, esc, fmt_bytes, fmt_duration
 
@@ -13,13 +13,15 @@ log = logging.getLogger(__name__)
 
 
 def buttons(*items: tuple[str, str]) -> dict | None:
-    """Кнопки под алертом (в один ряд). Слишком длинные callback_data (лимит Telegram 64 байта) пропускаем."""
+    """Кнопки под алертом (в один ряд). Первая — главное действие, она синяя. Слишком длинные callback_data
+    (лимит Telegram 64 байта) пропускаем."""
     row = [(t, d) for t, d in items if len(d.encode()) <= 64]
-    return kb(row) if row else None
+    return kb([(*row[0], "primary"), *row[1:]]) if row else None
 
 
 def forget_kb(kind: str, key: str, *extra: tuple[str, str]) -> dict | None:
-    return buttons(("Забыть", f"fg:{kind}:{key}"), *extra)
+    """«Забыть» — последней: главное действие под алертом другое, а забыть — на случай «так и задумано»."""
+    return buttons(*extra, ("Забыть", f"fg:{kind}:{key}"))
 
 
 class Alerts:
@@ -117,6 +119,8 @@ class Alerts:
 
     async def check_resources(self):
         m = system.metrics(self.cpu.pct())
+        self.state["metrics"] = trend.add_sample(self.state.data.get("metrics"), time.time(),
+                                                 m.cpu_pct, 100 - m.mem_avail_pct)
         await self.set("disk", m.disk_pct >= config.DISK_PCT, "диск", f"заполнен на {m.disk_pct:.0f}%",
                        markup=buttons(("🧹 Очистить диск", "nv:clean")))
         await self.set("cpu", m.cpu_pct >= config.CPU_PCT, "CPU",
@@ -363,7 +367,7 @@ class Alerts:
                 problem = (f"{target} недоступен со всех {v.total} узлов check-host.net в {flag} ({how}), "
                            f"а с контрольных доступен ({v.ctl_ok}/{v.ctl_total})")
             await self.set("geo", v.down, f"доступ из {flag}", problem,
-                           sustain=config.GEO_SUSTAIN, markup=buttons(("🌍 Проверить по миру", "nv:geo")))
+                           sustain=config.GEO_SUSTAIN, markup=buttons(("🌍 Проверить по миру", "nv:geow")))
 
     async def run_geo(self):
         if not config.GEO_COUNTRY:

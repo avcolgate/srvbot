@@ -5,12 +5,8 @@ import time
 
 from datetime import datetime
 
-from . import checkhost, config, docker, manage, report, system, tunnel
+from . import checkhost, config, docker, manage, report, system, trend, tunnel
 from .util import CmdError, btn, details, esc, fmt_ago, fmt_bytes, fmt_duration, h, mark, p, table, tg_time
-
-
-def _bar(pct: float) -> str:
-    return "🔴" if pct >= 90 else "🟡" if pct >= 75 else "🟢"
 
 
 
@@ -18,15 +14,24 @@ def unit_icon(state: str) -> str:
     return "🟢" if state == "active" else "🟡" if state in ("activating", "reloading") else "🔴"
 
 
-async def status() -> str:
+def _gauge(pct: float, note: str = "") -> str:
+    """«🟩🟩⬜⬜⬜⬜⬜⬜ 32%» и под ним пояснение."""
+    return f"{trend.bar(pct)} <b>{pct:.0f}%</b>" + (f"<br/><i>{note}</i>" if note else "")
+
+
+async def status() -> tuple[str, int]:
+    """Текст раздела и сколько адресов забанено сейчас — для счётчика на кнопке «Баны»."""
     m = system.metrics(await system.cpu_now())
+    rows = [["CPU", _gauge(m.cpu_pct)],
+            ["RAM", _gauge(100 - m.mem_avail_pct, f"доступно {fmt_bytes(m.mem_avail)}")]]
+    if m.swap_total:
+        rows.append(["swap", _gauge(m.swap_used / m.swap_total * 100,
+                                    f"{fmt_bytes(m.swap_used)} из {fmt_bytes(m.swap_total)}")])
+    rows.append(["диск", _gauge(m.disk_pct, f"свободно {fmt_bytes(m.disk_free)}")])
     blocks = [h("📊 Сервер"),
               p(f"⏱ аптайм {fmt_duration(m.uptime)}, load {m.load[0]:.2f} / {m.load[1]:.2f} / {m.load[2]:.2f}",
                 f"🌐 IP {esc(', '.join(system.public_ipv4()) or 'нет внешнего IPv4')}"),
-              table([[f"{_bar(m.cpu_pct)} CPU", f"{m.cpu_pct:.0f}%"],
-                     [f"{_bar(100 - m.mem_avail_pct)} RAM", f"доступно {fmt_bytes(m.mem_avail)} из {fmt_bytes(m.mem_total)}"
-                      + (f", swap {fmt_bytes(m.swap_used)}/{fmt_bytes(m.swap_total)}" if m.swap_total else "")],
-                     [f"{_bar(m.disk_pct)} диск", f"{m.disk_pct:.0f}%, свободно {fmt_bytes(m.disk_free)}"]])]
+              table(rows)]
     # службы и контейнеры — с кнопками перезапуска и журнала прямо в строке;
     # каждая внешняя команда в своём try: зависшая одна не должна ронять весь раздел
     svc = []
@@ -78,7 +83,7 @@ async def status() -> str:
                  c.days_left < config.CERT_WARN_DAYS) for c in certs])))
     if system.reboot_required():
         blocks.append(p(mark("⚠️ требуется перезагрузка")))
-    return "".join(blocks)
+    return "".join(blocks), sum(len(j.banned_now) for j in jails)
 
 
 is_online = tunnel.is_online
@@ -164,7 +169,8 @@ def risk_card(state: dict, insts: list[tunnel.Instance] | None = None) -> str:
     return "<blockquote>" + "<br/>".join(lines) + "</blockquote>"
 
 
-async def geo_view(pool, state: dict | None = None) -> str:
+async def geo_view(pool, state: dict | None = None, world: bool = True) -> str:
+    """Карточка риска (из состояния — мгновенно) и, если world, проверка с ~60 узлов по миру (до 40 с)."""
     target = ssh_target()
     if not target:
         return h("🌍 Доступность") + p("🔴 у сервера нет внешнего IPv4")
@@ -177,6 +183,9 @@ async def geo_view(pool, state: dict | None = None) -> str:
             except CmdError:
                 pass
         blocks.append(risk_card(state, insts))
+    if not world:
+        return "".join(blocks) + p("<i>Проверка с ~60 узлов check-host.net по всему миру — кнопкой ниже, "
+                                   "до 40 секунд</i>")
     started = time.monotonic()
     try:
         info = await asyncio.get_running_loop().run_in_executor(pool, checkhost.node_info)

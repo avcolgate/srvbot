@@ -7,6 +7,7 @@ import asyncio
 import http.client
 import json
 import logging
+import secrets
 import socket
 import ssl
 import time
@@ -39,14 +40,30 @@ def _connect_ipv4(address, timeout=None, source_address=None, **_):
     raise err
 
 
-def api_call(token: str, method: str, params: dict, timeout: float = 30):
-    """Синхронный вызов Bot API. Возвращает result или бросает TGError."""
-    body = json.dumps(params).encode()
+def _multipart(params: dict, files: dict[str, tuple[str, bytes, str]]) -> tuple[bytes, str]:
+    """Тело multipart/form-data: обычные поля (словари — JSON-строкой) и файлы {поле: (имя, данные, тип)}."""
+    boundary = secrets.token_hex(16)
+    parts = []
+    for k, v in params.items():
+        v = json.dumps(v) if isinstance(v, (dict, list, bool)) else str(v)
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode())
+    for k, (name, data, ctype) in files.items():
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"; filename="{name}"\r\n'
+                     f"Content-Type: {ctype}\r\n\r\n".encode() + data + b"\r\n")
+    return b"".join(parts) + f"--{boundary}--\r\n".encode(), f"multipart/form-data; boundary={boundary}"
+
+
+def api_call(token: str, method: str, params: dict, timeout: float = 30, files: dict | None = None):
+    """Синхронный вызов Bot API. Возвращает result или бросает TGError. files — для отправки картинок."""
+    if files:
+        body, ctype = _multipart(params, files)
+    else:
+        body, ctype = json.dumps(params).encode(), "application/json"
     for attempt in range(2):
         conn = http.client.HTTPSConnection(API_HOST, timeout=timeout, context=_ssl)
         conn._create_connection = _connect_ipv4
         try:
-            conn.request("POST", f"/bot{token}/{method}", body, {"Content-Type": "application/json"})
+            conn.request("POST", f"/bot{token}/{method}", body, {"Content-Type": ctype})
             resp = conn.getresponse()
             data = json.loads(resp.read() or b"{}")
         except (OSError, http.client.HTTPException, ValueError) as e:
@@ -81,10 +98,21 @@ class Bot:
         self.pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="tg")
         self._tasks: set[asyncio.Task] = set()
 
-    async def call(self, method: str, _timeout: float = 30, **params):
+    async def call(self, method: str, _timeout: float = 30, _files: dict | None = None, **params):
         params = {k: v for k, v in params.items() if v is not None}
         return await asyncio.get_running_loop().run_in_executor(
-            self.pool, api_call, self.token, method, params, _timeout)
+            self.pool, api_call, self.token, method, params, _timeout, _files)
+
+    async def edit_photo(self, chat_id: int, message_id: int, jpeg: bytes, markup: dict | None = None):
+        """Заменяет картинку в сообщении на месте (переключение периода графика)."""
+        await self.call("editMessageMedia", _timeout=60, _files={"photo": ("chart.jpg", jpeg, "image/jpeg")},
+                        chat_id=chat_id, message_id=message_id, media={"type": "photo", "media": "attach://photo"},
+                        reply_markup=markup)
+
+    async def send_photo(self, chat_id: int, jpeg: bytes, caption: str = "", markup: dict | None = None):
+        return await self.call("sendPhoto", _timeout=60, _files={"photo": ("chart.jpg", jpeg, "image/jpeg")},
+                               chat_id=chat_id, caption=caption or None, parse_mode="HTML" if caption else None,
+                               reply_markup=markup)
 
     @staticmethod
     def _rich(text: str) -> dict:
