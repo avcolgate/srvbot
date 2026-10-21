@@ -26,13 +26,23 @@ INTERACTIVE = contextvars.ContextVar("interactive", default=False)  # True вн�
 
 
 _hung: dict[str, float] = {}  # команда -> когда она последний раз не уложилась в таймаут
+
+
+def _tool(args: tuple[str, ...]) -> str:
+    """Имя команды для учёта зависаний: за обёртками (systemd-run, env) — сама команда, иначе зависший apt
+    помечал бы зависшими и все остальные запуски через systemd-run."""
+    if args[0] in ("systemd-run", "env"):
+        rest = [a for a in args[1:] if not a.startswith("-") and "=" not in a]
+        if rest:
+            return rest[0]
+    return args[0]
 HUNG_SKIP = 60                 # столько секунд команды из чата её не ждут
 
 
 async def run(*args: str, **kw) -> str:
     """Внешняя команда. Если она недавно зависала, из чата её не ждём: в разделе несколько таких команд,
     и таймауты складывались бы в минуту ожидания. Фоновые проверки пробуют всегда — по ним видно, ожила ли."""
-    tool, interactive = args[0], INTERACTIVE.get()
+    tool, interactive = _tool(args), INTERACTIVE.get()
 
     def skip():  # проверяем и до очереди, и после: пока стояли в очереди, команда могла зависнуть у соседа
         if interactive and tool in _hung and time.monotonic() - _hung[tool] < HUNG_SKIP:

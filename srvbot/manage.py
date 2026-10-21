@@ -18,7 +18,11 @@ from .util import CmdError, fmt_duration, run
 UPGRADE_UNIT = "srvbot-upgrade"
 UPGRADE_LOG = "/var/lib/srvbot/upgrade.log"  # папка только для root (в /var/log можно подменить ссылкой)
 UPGRADE_RC = "/var/lib/srvbot/upgrade.rc"
-APT_ENV = ("env", "DEBIAN_FRONTEND=noninteractive")
+# apt — в отдельном временном юните: даже симуляция берёт ~85 МБ и тянет в кэш базу пакетов, а в службе бота
+# это вместе с ним упиралось в лимит 300 МБ, и ядро вытесняло бота в swap (ответы по 10 с). Вывод и код
+# выхода systemd-run --wait --pipe передаёт как есть.
+APT_ENV = ("systemd-run", "--quiet", "--wait", "--pipe", "--collect", "--description=srvbot: apt",
+           "--setenv=DEBIAN_FRONTEND=noninteractive", "-p", "MemoryMax=400M")
 APT_OPTS = ("-o", "Dpkg::Options::=--force-confold", "-o", "Dpkg::Options::=--force-confdef")
 
 
