@@ -11,8 +11,10 @@ WorkingDirectory=@DIR@
 ExecStart=/usr/bin/python3 -m srvbot
 Restart=always
 RestartSec=10
-MemoryMax=200M
+MemoryMax=300M
 Environment=PYTHONUNBUFFERED=1
+# меньше арен glibc — меньше памяти оседает после картинок, которые рисуются в потоках
+Environment=MALLOC_ARENA_MAX=2
 
 [Install]
 WantedBy=multi-user.target

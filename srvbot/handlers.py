@@ -7,34 +7,45 @@ import socket
 import time
 from datetime import datetime
 
-from . import config, docker, manage, report, system, tunnel, views
+from . import config, docker, history, manage, system, tunnel, views
 from .alerts import Alerts
-from .tg import Bot, kb, reply_kb
+from .tg import Bot, TGError, kb, reply_kb
 from .util import INTERACTIVE, RICH_LEN, CmdError, State, cut_html, esc, fmt_ago, fmt_bytes, p, tg_time
 
 log = logging.getLogger(__name__)
 
-BTN = {"status": "📊 Сервер", "tun": "🔐 Клиенты", "geo": "🌍 Доступность",
-       "report": "📋 Отчёт", "ctl": "⚙️ Управление"}
-COMMANDS = {"status": "status", "clients": "tun", "geo": "geo", "bans": "bans", "report": "report", "control": "ctl"}
+BTN = {"status": "📊 Сервер", "tun": "🔐 Клиенты", "geo": "🌍 Доступность", "ctl": "⚙️ Управление"}
+COMMANDS = {"status": "status", "clients": "tun", "geo": "geo", "bans": "bans", "control": "ctl"}
 
 
 def main_kb() -> dict:
-    """Клавиатура внизу чата. Кнопка клиентов — только если туннель на сервере найден."""
-    top = [BTN["status"]] + ([BTN["tun"]] if tunnel.found() else []) + [BTN["geo"]]
-    return reply_kb(top, [BTN["report"], BTN["ctl"]])
+    """Клавиатура внизу чата, по две кнопки в ряд (три в ряд на телефоне обрезаются).
+    Кнопка клиентов — только если туннель на сервере найден."""
+    names = [BTN["status"]] + ([BTN["tun"]] if tunnel.found() else []) + [BTN["geo"], BTN["ctl"]]
+    return reply_kb(*[names[i:i + 2] for i in range(0, len(names), 2)])
 
 
 def bot_commands() -> list[tuple[str, str]]:
     cmds = [("status", "Сервер: нагрузка, службы, порты"), ("clients", "Клиенты туннеля"),
-            ("geo", "Доступность из разных стран"), ("bans", "fail2ban"), ("report", "Отчёт"),
+            ("geo", "Доступность из разных стран"), ("bans", "fail2ban"),
             ("control", "Управление"), ("menu", "Показать кнопки")]
     return [c for c in cmds if c[0] != "clients" or tunnel.found()]
 
 
 CTL_TEXT = "<b>⚙️ Управление</b>\nВыберите раздел. Любое действие выполняется только после подтверждения."
-CTL_KB = kb([("📦 Обновления", "v:upd"), ("🧹 Очистка диска", "v:clean")],
-            [("⏻ Перезагрузить сервер", "go:reboot:")])
+def ctl_kb() -> dict:
+    """Клавиатура «Управления» с индикаторами: сколько обновлений ждёт, заполнен ли диск, нужна ли
+    перезагрузка. Кнопка, которая сейчас требует внимания, — синяя. Всё читается из файлов, без команд."""
+    upd, _ = system.updates()
+    disk = shutil.disk_usage("/")
+    disk_pct = disk.used / disk.total * 100
+    reboot = system.reboot_required()
+    attn = lambda on: ["primary"] if on else []
+    return kb([("📦 Обновления" + (f" · {upd}" if upd else ""), "v:upd", *attn(upd)),
+               ("🧹 Очистка диска" + (f" · {disk_pct:.0f}%" if disk_pct >= config.DISK_PCT - 10 else ""), "v:clean",
+                *attn(disk_pct >= config.DISK_PCT - 10))],
+              [("🗒 История", "v:hist"), ("📜 Журналы", "v:logs")],
+              [("⏻ Перезагрузить сервер" + (" · нужно" if reboot else ""), "go:reboot:", *attn(reboot))])
 
 # Действия с подтверждением: kind -> arg -> (что сделать, предупреждение, куда вернуться)
 ACTIONS = {
@@ -47,9 +58,13 @@ ACTIONS = {
 }
 
 # Долгие разделы: сначала показываем «⏳», потом подменяем результатом
-SLOW = {"geo": views.GEO_WAIT}
+SLOW = {"geow": views.GEO_WAIT}
 # Разделы в rich-формате (заголовки, таблицы, сворачиваемые блоки); остальное — обычные сообщения
-RICH = {"status", "tun", "geo", "bans", "report"}
+RICH = {"status", "tun", "geo", "geow", "bans", "logs"}
+# Названия разделов для журнала службы
+VIEW_NAMES = {"status": "Сервер", "tun": "Клиенты", "geo": "Доступность", "geow": "Доступность по миру",
+              "bans": "Баны", "ctl": "Управление",
+              "upd": "Обновления", "clean": "Очистка диска", "hist": "История", "logs": "Журналы"}
 MAX_LEN = 4000
 
 
@@ -67,11 +82,44 @@ def cut(text: str, rich: bool = False) -> str:
     return cut_html(text, RICH_LEN if rich else MAX_LEN, rich)
 
 
+def describe_text(text: str) -> str:
+    """Сообщение владельца — понятными словами для журнала службы."""
+    text = text.strip()
+    if text.startswith("/"):
+        return f"команда {text.split()[0][:30]}"
+    view = next((k for k, v in BTN.items() if v == text), None)
+    return f"раздел «{VIEW_NAMES[view]}»" if view else f"сообщение {text[:30]!r}"
+
+
+def describe_data(data: str) -> str:
+    """Нажатие inline-кнопки — понятными словами для журнала службы."""
+    kind, _, arg = data.partition(":")
+    if kind in ("v", "nv"):
+        return f"раздел «{VIEW_NAMES.get(arg, arg)}»"
+    if kind in ("go", "ga"):
+        k, _, a = arg.partition(":")
+        return f"запрос подтверждения: {ACTIONS[k](a)[0]}" if k in ACTIONS else f"запрос подтверждения: {data[:40]}"
+    if kind == "do":
+        return "подтверждение действия"
+    if kind in ("lg", "la"):
+        return f"журнал {arg.partition(':')[2]}"
+    if kind == "ub":
+        jail, _, ip = arg.partition(":")
+        return f"разбан {ip} в {jail}"
+    return {"x": "отмена", "aptu": "проверка обновлений (apt update)", "chart": f"картинка «Сервер» за {arg or 1} дн.",
+            "fg": f"не следить: {arg[:40]}"}.get(
+        kind, f"кнопка {data[:40]!r}")
+
+
 class Handlers:
     def __init__(self, bot: Bot, state: State, alerts: Alerts):
         self.bot, self.state, self.alerts = bot, state, alerts
         # Подтверждения опасных действий: token -> [описание, kind, arg, срок (0 — ещё не спрашивали)]
         self.pending: dict[str, list] = {}
+        # Нажатия, которые ещё выполняются: повтор той же кнопки (или того же раздела) не ставим в очередь —
+        # иначе при медленном сервере нетерпеливые нажатия копятся и ответ на последнее ждёт минуту
+        self.busy: set[tuple] = set()
+        self.chart_lock = asyncio.Lock()  # картинки — по одной: каждая на время рисования берёт ~100 МБ
 
     async def __call__(self, update: dict):
         INTERACTIVE.set(True)  # свой слот и короткий таймаут для внешних команд (см. util.run)
@@ -79,13 +127,38 @@ class Handlers:
         if msg := update.get("message"):
             if msg.get("from", {}).get("id") == config.OWNER_ID and msg.get("chat", {}).get("id") == config.OWNER_ID \
                     and "text" in msg:
-                log.info("update %s: %r", update.get("update_id"), msg["text"][:50])
-                await self.on_message(msg)
+                key = ("msg", msg["text"].strip())
+                if key in self.busy:
+                    log.info("%s — повтор, ещё выполняется", describe_text(msg["text"]))
+                    await self.bot.delete(msg["chat"]["id"], msg["message_id"])
+                    return
+                self.busy.add(key)
+                try:
+                    await self.logged(describe_text(msg["text"]), self.on_message(msg))
+                finally:
+                    self.busy.discard(key)
         elif cq := update.get("callback_query"):
             if cq.get("from", {}).get("id") == config.OWNER_ID \
                     and cq.get("message", {}).get("chat", {}).get("id") == config.OWNER_ID:
-                log.info("update %s: %r", update.get("update_id"), cq.get("data"))
-                await self.on_callback(cq)
+                key = ("cb", cq["message"].get("message_id"), cq.get("data", ""))
+                if key in self.busy:
+                    log.info("%s — повтор, ещё выполняется", describe_data(cq.get("data", "")))
+                    await self.bot.answer(cq["id"], "уже выполняю…")
+                    return
+                self.busy.add(key)
+                try:
+                    await self.logged(describe_data(cq.get("data", "")), self.on_callback(cq))
+                finally:
+                    self.busy.discard(key)
+
+    @staticmethod
+    async def logged(what: str, coro):
+        """В журнал службы — что нажато, понятными словами, и сколько заняло."""
+        started = time.monotonic()
+        try:
+            await coro
+        finally:
+            log.info("%s — %.1f с", what, time.monotonic() - started)
 
     # --- представления ---
 
@@ -100,22 +173,32 @@ class Handlers:
 
     async def _render(self, view: str) -> tuple[str, dict | None]:
         if view == "status":
-            return await views.status(), kb([("⟳ Обновить", "v:status"), ("🛡 Баны", "v:bans")])
+            text, banned = await views.status()
+            return text, kb([("⟳ Обновить", "v:status"), ("📈 За сутки", "chart:")],
+                            [("🛡 Баны" + (f" · {banned}" if banned else ""), "v:bans")])
         if view == "tun":
-            text = await views.tunnel_view(pool=self.bot.pool, emojis=self.state.data.get("tunnel_emoji"))
+            text = await views.tunnel_view(emojis=self.state.data.get("tunnel_emoji"),
+                                          traffic=self.state.data.get("traffic"))
             return text, refresh_kb(view)
-        if view == "geo":
-            return await views.geo_view(self.bot.pool, self.state.data), refresh_kb(view)
+        if view == "geo":  # мгновенно — из состояния; проверка по миру долгая, только по кнопке
+            return (await views.geo_view(self.bot.pool, self.state.data, world=False),
+                    kb([("⟳ Обновить", "v:geo"), ("🌍 Проверить по миру", "v:geow")]))
+        if view == "geow":
+            return (await views.geo_view(self.bot.pool, self.state.data),
+                    kb([("⟳ Проверить заново", "v:geow"), ("◀ Кратко", "v:geo")]))
         if view == "bans":
             return await views.bans(), kb([("⟳ Обновить", "v:bans"), ("◀ Сервер", "v:status")])
-        if view == "report":
-            return (await report.build(self.state))[0], refresh_kb(view)
         if view == "ctl":
-            return CTL_TEXT, CTL_KB
+            return CTL_TEXT, ctl_kb()
         if view == "upd":
             return await self.updates_view()
         if view == "clean":
             return await self.clean_view()
+        if view == "hist":
+            return history.view(self.state), kb([("⟳ Обновить", "v:hist")], [("◀ Управление", "v:ctl")])
+        if view == "logs":
+            return await views.journals(), kb([("⟳ Обновить", "v:logs"), ("🤖 Журнал бота", "lg:u:srvbot")],
+                                              [("◀ Управление", "v:ctl")])
         raise ValueError(view)
 
     async def updates_view(self) -> tuple[str, dict]:
@@ -137,7 +220,7 @@ class Handlers:
             lines.append(f"<i>списки пакетов проверялись {fmt_ago(ts)}</i>")
         except OSError:
             pass
-        row = [("🔍 Проверить заново", "aptu:")] + ([("✅ Установить", "go:upgrade:")] if pkgs else [])
+        row = [("🔍 Проверить заново", "aptu:")] + ([("✅ Установить", "go:upgrade:", "success")] if pkgs else [])
         return "\n".join(lines), kb(row, back)
 
     async def clean_view(self) -> tuple[str, dict]:
@@ -150,7 +233,7 @@ class Handlers:
         lines += [f"• {names[k]} — {fmt_bytes(v)}" for k, v in est.items()]
         lines.append("• ненужные пакеты (apt autoremove) — сколько найдётся")
         lines.append(f"\n<i>всего ~{fmt_bytes(sum(est.values()))}; данные контейнеров и настройки не трогаются</i>")
-        return "\n".join(lines), kb([("🧹 Очистить", "go:clean:")], [("◀ Управление", "v:ctl")])
+        return "\n".join(lines), kb([("🧹 Очистить", "go:clean:", "success")], [("◀ Управление", "v:ctl")])
 
     async def logs_view(self, what: str, name: str) -> tuple[str, dict]:
         try:
@@ -169,6 +252,30 @@ class Handlers:
             size += len(line) + 1
         text = f"<b>📜 {esc(name)}</b> — последние строки\n<pre>" + "\n".join(reversed(kept)) + "</pre>"
         return stamp(text), kb([("⟳ Обновить", f"lg:{what}:{name}"), ("◀ Сервер", "v:status")])
+
+    async def send_chart(self, chat: int, days: int, mid: int | None = None):
+        """Картинка «Сервер» за days дней: новым сообщением или (mid) заменой картинки на месте.
+        Под ней — переключатель периода, текущий подсвечен."""
+        from . import chart  # Pillow грузится только при рисовании
+        if days not in chart.PERIODS:
+            return
+        cpu = await system.cpu_now(0.2)  # обычно — готовое значение фонового замера
+        m = system.metrics(cpu)
+        try:
+            async with self.chart_lock:
+                jpeg = await asyncio.get_running_loop().run_in_executor(
+                    self.bot.pool, chart.render, self.state.data.get("metrics"),
+                    (self.state.data.get("traffic") or {}).get("series"), time.time(), cpu, 100 - m.mem_avail_pct,
+                    days)
+        except chart.ChartError as e:
+            await self.bot.send(chat, f"🔴 График не нарисовался: {esc(e)}")
+            return
+        markup = kb([(chart.PERIODS[d][0].capitalize(), f"chart:{d}", *(["primary"] if d == days else []))
+                     for d in chart.PERIODS], [("✖ Закрыть", "x:")])
+        if mid:
+            await self.bot.edit_photo(chat, mid, jpeg, markup)
+        else:
+            await self.bot.send_photo(chat, jpeg, markup=markup)
 
     def ask(self, kind: str, arg: str) -> str:
         """Регистрирует действие, ждущее подтверждения; токен живёт CONFIRM_TTL секунд."""
@@ -226,7 +333,12 @@ class Handlers:
                 await self.bot.edit(chat, mid, SLOW[arg])
             text, markup = await self.render(arg)
             rich = arg in RICH
-            await self.bot.edit(chat, mid, cut(text, rich), markup, rich=rich)
+            try:
+                await self.bot.edit(chat, mid, cut(text, rich), markup, rich=rich)
+            except TGError as e:  # сообщение удалено или слишком старое — ответим новым, а не молчанием
+                log.info("правка не удалась (%s), отправляю раздел заново", e)
+                sent = await self.bot.send(chat, cut(text, rich), markup, rich=rich)
+                await self.replace_view(chat, sent["message_id"])
         elif kind == "go":
             await self.on_ask(cq, chat, mid, *arg.partition(":")[::2])
         # Кнопки под алертами: результат — новым сообщением, сам алерт остаётся в чате
@@ -261,15 +373,21 @@ class Handlers:
             await self.bot.edit(chat, mid, cut(text), markup)
         elif kind == "do":
             await self.on_do(cq, chat, mid, arg)
+        elif kind == "chart":
+            await self.bot.answer(cq["id"], "рисую…")
+            # из раздела «Сервер» — новой картинкой за сутки; с кнопок под картинкой — перерисовка на месте
+            await self.send_chart(chat, int(arg) if arg.isdigit() else 1, mid if arg else None)
         elif kind == "ub":
             jail, _, ip = arg.partition(":")
             try:
                 await system.unban(jail, ip)
+                history.record(self.state, f"разбан {ip}", detail=jail)
                 await self.bot.answer(cq["id"], f"{ip} разбанен", alert=True)
                 text, markup = await self.render("bans")  # кнопка «Разбанить» у адреса должна исчезнуть
                 await self.bot.edit(chat, mid, cut(text, True), markup, rich=True)
                 await self.bot.send(chat, f"✅ {esc(ip)} разбанен в {esc(jail)}")
             except CmdError as e:
+                history.record(self.state, f"разбан {ip}", ok=False, detail=str(e))
                 await self.bot.answer(cq["id"], f"Ошибка: {e}"[:200], alert=True)
         elif kind == "fg":
             what, _, key = arg.partition(":")
@@ -309,21 +427,23 @@ class Handlers:
         desc, _, back = ACTIONS[kind](arg)
         back_kb = kb([("◀ Назад", f"v:{back}")])
         await self.bot.answer(cq["id"])
+        started = time.monotonic()
         try:
             if kind == "reboot":
                 await self.bot.edit(chat, mid, "⏻ Перезагружаю сервер… Бот напишет, когда сервер поднимется.")
-                self.state.save()
+                history.record(self.state, desc, detail="запущена")
                 await asyncio.sleep(1)
                 await system.reboot()
                 return
             if kind == "upgrade":
                 await manage.start_upgrade()
                 self.state["upgrade"] = {"started": time.time()}
-                self.state.save()
+                history.record(self.state, desc, detail="запущена в фоне, результат — отдельной записью")
                 await self.bot.edit(chat, mid, "⏳ Устанавливаю обновления в фоне. Результат придёт отдельным "
                                                "сообщением (обычно 1–5 минут).", back_kb)
                 return
         except CmdError as e:
+            history.record(self.state, desc, ok=False, detail=str(e))
             await self.bot.edit(chat, mid, f"🔴 Ошибка ({esc(desc)}): {esc(e)}", back_kb)
             return
         await self.bot.edit(chat, mid, f"⏳ {esc(desc)}…")
@@ -338,9 +458,13 @@ class Handlers:
                 before = manage.disk_free()
                 done = await manage.clean()
                 freed = max(0, manage.disk_free() - before)
+                history.record(self.state, desc, detail=f"освобождено {fmt_bytes(freed)}",
+                               took=time.monotonic() - started)
                 await self.bot.edit(chat, mid, f"✅ <b>Очистка завершена</b> — освобождено {fmt_bytes(freed)}\n"
                                     + "\n".join(f"• {esc(d)}" for d in done), back_kb)
                 return
+            history.record(self.state, desc, took=time.monotonic() - started)
             await self.bot.edit(chat, mid, f"✅ Выполнено: {esc(desc)}", back_kb)
         except CmdError as e:
+            history.record(self.state, desc, ok=False, detail=str(e), took=time.monotonic() - started)
             await self.bot.edit(chat, mid, f"🔴 Ошибка ({esc(desc)}): {esc(e)}", back_kb)

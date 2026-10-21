@@ -4,10 +4,14 @@ import json
 import os
 import re
 import shutil
+import time
+from collections import Counter
+from datetime import datetime
 
 import psutil
 
-from .util import CmdError, run
+from . import config
+from .util import CmdError, fmt_duration, run
 
 # --- обновления ---
 
@@ -124,8 +128,82 @@ async def container_logs(name: str, n: int = 25) -> str:
         return await run("docker", "logs", "--tail", str(n), name, merge=True)
     except CmdError as e:
         if "does not support reading" in str(e):
-            return "журнал у этого контейнера отключён (log driver none в его настройках)"
+            return await container_history(name, n)
         raise
+
+
+async def container_history(name: str, n: int = 25) -> str:
+    """Вместо журнала контейнера, у которого логи отключены (log driver none — так задумано, чтобы не копить
+    следы подключений): его состояние из docker inspect и что о нём за неделю записал сам бот — алерты,
+    кто из клиентов подключался и отключался."""
+    fmt = ("{{.State.Status}}|{{.State.StartedAt}}|{{.RestartCount}}|{{.HostConfig.RestartPolicy.Name}}|"
+           "{{.State.OOMKilled}}|{{.State.ExitCode}}")
+    status, started, restarts, policy, oom, code = (await run("docker", "inspect", "--format", fmt, name)).strip().split("|")
+    when = datetime.fromisoformat(started[:19] + "+00:00")
+    status = {"running": "работает", "exited": "остановлен", "restarting": "перезапускается",
+              "paused": "на паузе", "created": "создан, не запущен", "dead": "мёртв"}.get(status, status)
+    head = ["журнал контейнера отключён (log driver none), вместо него:",
+            f"{status}, запущен {when.astimezone(config.TZ):%d.%m %H:%M} "
+            f"({fmt_duration(time.time() - when.timestamp())} назад)",
+            f"перезапусков {restarts} (политика {policy})"
+            + (", последний раз убит из-за нехватки памяти" if oom == "true" else "")
+            + (f", последний код выхода {code}" if code not in ("0", "") else "")]
+    out = await run("journalctl", "-u", "srvbot", "--since", "-7d", "--no-pager", "-o", "short-unix",
+                    "--grep", re.escape(name), check=False, timeout=15)
+    own = []  # время — в часовом поясе бота, как и всё остальное в сообщениях
+    for line in out.splitlines():
+        m = re.match(r"(\d+)\.\d+ \S+ python3\[\d+\]: (?:INFO |WARNING )?srvbot\.(\w+): (.*)", line)
+        if m and m.group(2) != "handlers":
+            own.append(f"{datetime.fromtimestamp(int(m.group(1)), config.TZ):%d.%m %H:%M} {m.group(3)}")
+    return "\n".join(head + ["", "из журнала бота за неделю:"] + (own[-n:] or ["записей нет"]))
+
+
+# --- сводки журналов за сутки (раздел 📜 Журналы) ---
+
+SSH_IDS = ("-t", "sshd", "-t", "sshd-session")  # в OpenSSH ≥ 9.8 соединения обслуживает sshd-session
+_LINE = re.compile(r"\S+ +\d+ [\d:]+ \S+ ([^\s\[:]+)(?:\[(\d+)\])?: (.*)")  # journalctl -o short
+_SSH_FAIL = re.compile(r"Failed \S+ for|Invalid user|(Connection closed|Disconnected) by (authenticating|invalid) user"
+                       r"|maximum authentication attempts")
+_NUM = re.compile(r"\b\d+(?:\.\d+)*\b")
+
+
+async def ssh_summary(since: str = "-24h") -> dict:
+    out = await run("journalctl", *SSH_IDS, "--since", since, "--no-pager", "-o", "short", check=False, timeout=20)
+    return parse_ssh(out)
+
+
+def parse_ssh(out: str) -> dict:
+    """Успешные входы {(пользователь, адрес, способ): сколько раз} и неудачные подключения: одно соединение —
+    один процесс sshd, поэтому несколько строк о нём (Invalid user + Connection closed) считаются один раз."""
+    accepted, failed = Counter(), {}
+    for line in out.splitlines():
+        m = _LINE.match(line)
+        if not m:
+            continue
+        msg = m.group(3)
+        if a := re.match(r"Accepted (\S+) for (\S+) from (\S+)", msg):
+            accepted[(a.group(2), a.group(3), a.group(1))] += 1
+        elif _SSH_FAIL.search(msg):
+            ip = re.search(r" from (\S+)| user \S+ (\d[\d.:a-f]*) port", msg)
+            failed[m.group(2) or line] = ip and (ip.group(1) or ip.group(2))
+    return {"accepted": accepted, "failed": len(failed), "failed_ips": len({x for x in failed.values() if x})}
+
+
+async def errors_summary(since: str = "-24h", top: int = 10) -> tuple[int, list[tuple[str, int]]]:
+    out = await run("journalctl", "-p", "err", "--since", since, "--no-pager", "-o", "short", check=False, timeout=20)
+    return group_errors(out, top)
+
+
+def group_errors(out: str, top: int = 10) -> tuple[int, list[tuple[str, int]]]:
+    """Системные ошибки, сгруппированные по источнику и тексту (числа и адреса заменены на N).
+    sshd пропускаем: попытки входа — отдельной сводкой."""
+    c = Counter()
+    for line in out.splitlines():
+        m = _LINE.match(line)
+        if not m or m.group(1) in ("sshd", "sshd-session"):
+            continue
+        c[f"{m.group(1)}: {_NUM.sub('N', m.group(3))[:160]}"] += 1
+    return sum(c.values()), c.most_common(top)
 
 
 # --- очистка диска ---

@@ -6,7 +6,7 @@ import time
 
 import psutil
 
-from . import config, tunnel
+from . import config, system, tunnel
 from .alerts import Alerts
 from .handlers import Handlers, bot_commands, main_kb
 from .tg import Bot, TGError
@@ -52,7 +52,8 @@ async def main():
 
     stop = asyncio.Event()
     asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, stop.set)
-    tasks = [asyncio.create_task(alerts.run()), asyncio.create_task(bot.poll(Handlers(bot, state, alerts)))]
+    tasks = [asyncio.create_task(alerts.run()), asyncio.create_task(bot.poll(Handlers(bot, state, alerts))),
+             asyncio.create_task(system.sample_cpu())]
     waiter = asyncio.create_task(stop.wait())
     done, _ = await asyncio.wait([waiter, *tasks], return_when=asyncio.FIRST_COMPLETED)
     for t in tasks + [waiter]:

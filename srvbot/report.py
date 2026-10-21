@@ -14,23 +14,86 @@ def delta(cur: int, prev: int | None) -> int:
     return cur - prev if cur >= prev else cur
 
 
-def day_traffic(day: dict | None, insts: list[tunnel.Instance], today: str) -> tuple[dict, int, int]:
-    """Трафик клиентов за сегодня: (обновлённый снимок, принято байт, отправлено байт).
-    day = {"date": "ГГГГ-ММ-ДД", "base": {"контейнер/ключ": [rx, tx]}} — счётчики на начало дня;
-    в новый день база обнуляется текущими счётчиками."""
-    cur = {f"{i.container}/{p.pubkey}": [p.rx, p.tx] for i in insts if not i.error for p in i.peers}
-    if not day or day.get("date") != today:
-        return {"date": today, "base": cur}, 0, 0
-    base = day.get("base", {})
-    rx = sum(delta(v[0], (base.get(k) or [None, None])[0]) for k, v in cur.items())
-    tx = sum(delta(v[1], (base.get(k) or [None, None])[1]) for k, v in cur.items())
-    return day, rx, tx
+HOUR = 3600
+KEEP_HOURS = 48  # почасовые суммы по клиентам храним за двое суток: хватает и на «24 ч», и на «сегодня»
+SERIES_HOURS = 31 * 24  # общий трафик всех клиентов по часам — за месяц, для картинки
 
 
-def snapshot(insts: list[tunnel.Instance], jails: list[system.Jail]) -> dict:
+def account(led: dict | None, insts: list[tunnel.Instance], now: float, complete: bool = False) -> dict:
+    """Накопительный учёт трафика клиентов. Счётчики туннеля обнуляются при его перезапуске, поэтому
+    прирост между проверками копится в состоянии бота и переживает перезапуски туннеля и бота.
+    led = {"since": начало учёта, "total": [rx, tx], "peers": {"контейнер/ключ":
+           {"last": [rx, tx] — счётчики на прошлой проверке, "total": [rx, tx], "hours": [[начало часа, rx, tx], …]}},
+           "series": [[начало часа, rx, tx], …] — сумма по всем клиентам за месяц}
+    complete — прочитаны все контейнеры: удалённых клиентов можно забыть (общий итог их трафик сохраняет)."""
+    led = led or {"since": now, "total": [0, 0], "peers": {}}
+    hour = int(now // HOUR * HOUR)
+    if "series" not in led:  # учёт старше этого поля: собираем ряд из почасовых сумм клиентов
+        by_hour: dict[int, list[int]] = {}
+        for rec in led["peers"].values():
+            for h, rx, tx in rec["hours"]:
+                cur = by_hour.setdefault(h, [0, 0])
+                cur[0], cur[1] = cur[0] + rx, cur[1] + tx
+        led["series"] = [[h, *v] for h, v in sorted(by_hour.items())]
+    series = led["series"]
+    seen = set()
+    for i in insts:
+        if i.error:
+            continue
+        for p in i.peers:
+            key = f"{i.container}/{p.pubkey}"
+            seen.add(key)
+            rec = led["peers"].setdefault(key, {"last": None, "total": [0, 0], "hours": []})
+            last = rec["last"] or [None, None]
+            drx, dtx = delta(p.rx, last[0]), delta(p.tx, last[1])
+            rec["last"] = [p.rx, p.tx]
+            if not drx + dtx:
+                continue
+            rec["total"] = [rec["total"][0] + drx, rec["total"][1] + dtx]
+            led["total"] = [led["total"][0] + drx, led["total"][1] + dtx]
+            if series and series[-1][0] == hour:
+                series[-1][1] += drx
+                series[-1][2] += dtx
+            else:
+                series.append([hour, drx, dtx])
+            if rec["hours"] and rec["hours"][-1][0] == hour:
+                rec["hours"][-1][1] += drx
+                rec["hours"][-1][2] += dtx
+            else:
+                rec["hours"].append([hour, drx, dtx])
+            rec["hours"] = [x for x in rec["hours"] if x[0] > hour - KEEP_HOURS * HOUR]
+    if complete:
+        led["peers"] = {k: v for k, v in led["peers"].items() if k in seen}
+    led["series"] = [x for x in series if x[0] > hour - SERIES_HOURS * HOUR]
+    return led
+
+
+def since(rec: dict | None, ts: float) -> tuple[int, int]:
+    """Трафик клиента (rx, tx) за часы, начавшиеся не раньше ts."""
+    hours = [x for x in (rec or {}).get("hours", []) if x[0] >= ts]
+    return sum(x[1] for x in hours), sum(x[2] for x in hours)
+
+
+def day_start(now: float) -> float:
+    """Начало окна «последние 24 часа»: текущий час и 23 предыдущих."""
+    return now // HOUR * HOUR - 23 * HOUR
+
+
+def last_day(rec: dict | None, now: float) -> tuple[int, int]:
+    return since(rec, day_start(now))
+
+
+def total_since(led: dict | None, ts: float, prefix: str = "") -> tuple[int, int]:
+    """Сумма по всем клиентам (или по контейнеру — prefix «контейнер/»)."""
+    parts = [since(r, ts) for k, r in (led or {}).get("peers", {}).items() if k.startswith(prefix)]
+    return sum(x[0] for x in parts), sum(x[1] for x in parts)
+
+
+def snapshot(led: dict | None, jails: list[system.Jail]) -> dict:
     return {
         "ts": time.time(),
-        "tunnel": {f"{i.container}/{p.pubkey}": [p.rx, p.tx] for i in insts for p in i.peers},
+        "v": 2,  # tunnel — накопленные итоги из учёта трафика (в v1 были сырые счётчики туннеля)
+        "tunnel": {k: r["total"] for k, r in (led or {}).get("peers", {}).items()},
         "f2b": {j.name: j.total_banned for j in jails},
     }
 
@@ -56,12 +119,16 @@ async def build(state: State) -> tuple[str, dict]:
     if insts:
         lines.append(h("🔐 Клиенты — трафик за период", 4))
     rows = []
+    led = state.data.get("traffic") or {}
+    prev_tun = prev.get("tunnel", {}) if prev.get("v") == 2 else {}
     for inst in insts:
         if inst.error:
             lines.append(p(f"🔴 {esc(inst.container)}: {esc(inst.error)}"))
         for peer in inst.peers:
-            pr = prev.get("tunnel", {}).get(f"{inst.container}/{peer.pubkey}", [None, None])
-            drx, dtx = delta(peer.rx, pr[0]), delta(peer.tx, pr[1])
+            key = f"{inst.container}/{peer.pubkey}"
+            cur = (led.get("peers", {}).get(key) or {}).get("total", [0, 0])
+            pr = prev_tun.get(key, [None, None])
+            drx, dtx = delta(cur[0], pr[0]), delta(cur[1], pr[1])
             if drx + dtx:
                 em = (state.data.get("tunnel_emoji") or {}).get(peer.pubkey, "•")
                 rows.append((drx + dtx, [f"{em} <b>{esc(peer.label)}</b>", f"↓ {fmt_bytes(dtx)}", f"↑ {fmt_bytes(drx)}"]))
@@ -72,5 +139,5 @@ async def build(state: State) -> tuple[str, dict]:
     elif insts:
         lines.append(p("трафика не было"))
 
-    return "".join(lines), snapshot(insts, jails)
+    return "".join(lines), snapshot(led, jails)
 

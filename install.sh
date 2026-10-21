@@ -59,11 +59,13 @@ fi
 # --- проверки ---
 command -v apt-get >/dev/null || die "нужен Debian/Ubuntu (apt)"
 python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2>/dev/null || die "нужен Python 3.10+"
-if ! python3 -c 'import psutil' 2>/dev/null; then
-    say "Ставлю python3-psutil"
+# psutil — метрики; Pillow и шрифт DejaVu — картинка с графиками (~4 МБ, грузится только при рисовании)
+if ! python3 -c 'import psutil, PIL' 2>/dev/null || [ ! -f /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf ]; then
+    say "Ставлю python3-psutil, python3-pil, fonts-dejavu-core"
     # на свежем сервере списки пакетов пусты, а apt может быть занят автообновлением
     apt-get -o DPkg::Lock::Timeout=300 update -qq
-    apt-get -o DPkg::Lock::Timeout=300 install -y -qq python3-psutil >/dev/null
+    apt-get -o DPkg::Lock::Timeout=300 install -y -qq --no-install-recommends \
+        python3-psutil python3-pil fonts-dejavu-core >/dev/null
 fi
 
 # --- токен и владелец ---

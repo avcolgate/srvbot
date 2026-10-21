@@ -1,10 +1,11 @@
 """Фоновые проверки: 🔴 при появлении проблемы, 🟢 при восстановлении, без повторов."""
 import asyncio
 import logging
+import re
 import time
 from datetime import datetime
 
-from . import checkhost, config, docker, manage, report, system, tunnel
+from . import checkhost, config, docker, history, manage, report, system, trend, tunnel
 from .tg import Bot, kb
 from .util import RICH_LEN, CmdError, State, cut_html, esc, fmt_bytes, fmt_duration
 
@@ -12,13 +13,15 @@ log = logging.getLogger(__name__)
 
 
 def buttons(*items: tuple[str, str]) -> dict | None:
-    """Кнопки под алертом (в один ряд). Слишком длинные callback_data (лимит Telegram 64 байта) пропускаем."""
+    """Кнопки под алертом (в один ряд). Первая — главное действие, она синяя. Слишком длинные callback_data
+    (лимит Telegram 64 байта) пропускаем."""
     row = [(t, d) for t, d in items if len(d.encode()) <= 64]
-    return kb(row) if row else None
+    return kb([(*row[0], "primary"), *row[1:]]) if row else None
 
 
 def forget_kb(kind: str, key: str, *extra: tuple[str, str]) -> dict | None:
-    return buttons(("Забыть", f"fg:{kind}:{key}"), *extra)
+    """«Забыть» — последней: главное действие под алертом другое, а забыть — на случай «так и задумано»."""
+    return buttons(*extra, ("Забыть", f"fg:{kind}:{key}"))
 
 
 class Alerts:
@@ -35,10 +38,15 @@ class Alerts:
         self.peer_rx: dict[str, int] = {}      # ключ клиента -> принято байт на прошлой проверке
         self.online_prev: dict[str, int] = {}  # контейнер -> сколько клиентов было в сети на прошлой проверке
         self.mass_drop: set[str] = set()       # контейнеры, где все клиенты пропали разом
+        self.shared_prev: dict[str, bool] = {} # контейнер -> клиенты в сети выходили с одного адреса
+        self.online_keys: dict[str, set[str]] = {}  # контейнер -> ключи клиентов в сети (для журнала службы)
         self.geo_nodes: dict = {}              # кэш узлов check-host для проверки из страны
 
     async def send(self, text: str, markup=None, reply_to: int | None = None, rich: bool = False) -> dict | None:
-        """Отправленное сообщение или None, если Telegram не принял."""
+        """Отправленное сообщение или None, если Telegram не принял. Каждое уведомление — и в журнал службы:
+        потом по нему можно восстановить, что и когда происходило."""
+        first = re.sub(r"<[^>]+>", "", text).strip().splitlines()
+        log.info("уведомление: %s", first[0][:300] if first else "")
         try:
             return await self.bot.send(config.OWNER_ID, cut_html(text, RICH_LEN if rich else 4000, rich), markup,
                                        reply_to, rich=rich)
@@ -46,12 +54,13 @@ class Alerts:
             log.exception("send failed")
             return None
 
-    async def set(self, key: str, bad: bool, title: str, problem: str = "", sustain: int = 1, markup=None):
+    async def set(self, key: str, bad: bool, title: str, problem: str = "", sustain: int = 1, markup=None,
+                  icon: str = "🔴"):
         if bad:
             self.streak[key] = self.streak.get(key, 0) + 1
             # активным алерт становится только после успешной отправки — иначе повторим в следующий цикл
             if self.streak[key] >= sustain and key not in self.active:
-                if msg := await self.send(f"🔴 <b>{esc(title)}</b>: {esc(problem)}", markup):
+                if msg := await self.send(f"{icon} <b>{esc(title)}</b>: {esc(problem)}", markup):
                     self.active[key] = {"title": title, "mid": msg["message_id"], "since": time.time()}
                     self.state.save()
         else:
@@ -110,6 +119,8 @@ class Alerts:
 
     async def check_resources(self):
         m = system.metrics(self.cpu.pct())
+        self.state["metrics"] = trend.add_sample(self.state.data.get("metrics"), time.time(),
+                                                 m.cpu_pct, 100 - m.mem_avail_pct)
         await self.set("disk", m.disk_pct >= config.DISK_PCT, "диск", f"заполнен на {m.disk_pct:.0f}%",
                        markup=buttons(("🧹 Очистить диск", "nv:clean")))
         await self.set("cpu", m.cpu_pct >= config.CPU_PCT, "CPU",
@@ -221,7 +232,7 @@ class Alerts:
                 await self.set(key, False, info.get("title", "клиент"))
             for k in [k for k in self.peer_rx if k not in current]:
                 del self.peer_rx[k]
-        await self.check_traffic(ok)
+        await self.check_traffic(ok, complete=bool(ok) and len(ok) == len(insts))
 
     async def check_blocking(self, inst: tunnel.Instance, emojis: dict[str, str], now: float):
         """Два ранних признака блокировки адреса: клиент шлёт пакеты без рукопожатия (сеть режет начало
@@ -234,27 +245,58 @@ class Alerts:
                            "шлёт пакеты, но рукопожатие не проходит — похоже, сеть режет начало соединения",
                            sustain=config.TUNNEL_STALL_CHECKS, markup=links)
             self.peer_rx[p.pubkey] = p.rx
+        self.log_online(inst, now)
         online = sum(tunnel.is_online(p, now) for p in inst.peers)
         prev = self.online_prev.get(inst.container, 0)
         self.online_prev[inst.container] = online
+        shared = self.shared_prev.get(inst.container, False)
+        if online:
+            self.shared_prev[inst.container] = tunnel.shared_network(inst.peers, now)
         if tunnel.mass_drop(prev, online):
             self.mass_drop.add(inst.container)
+            log.warning("клиенты %s: пропали все %d разом; последние адреса: %s", inst.container, prev,
+                        ", ".join(f"{p.label} {p.endpoint_ip or '?'} ({fmt_duration(now - p.handshake)} назад)"
+                                  for p in inst.peers if p.handshake) or "нет")
         elif online:
             self.mass_drop.discard(inst.container)
+        if shared:
+            problem, icon = (f"все {prev} клиентов пропали одновременно, но все они были за одним адресом — "
+                             f"скорее пропала сеть у них, а не блокировка сервера"), "🟡"
+        else:
+            problem, icon = f"все {prev} клиентов пропали одновременно — похоже на блокировку адреса сервера", "🔴"
         await self.set(f"drop:{inst.container}", inst.container in self.mass_drop, f"клиенты {inst.container}",
-                       f"все {prev} клиентов пропали одновременно — похоже на блокировку адреса сервера",
-                       markup=links)
+                       problem, markup=links, icon=icon)
         if inst.container in self.mass_drop and prev and config.GEO_COUNTRY:
             try:  # внеочередная проверка из страны — её алерт придёт следом
                 await self.check_geo(self.geo_nodes)
             except Exception:
                 log.exception("check geo after mass drop failed")
 
-    async def check_traffic(self, insts: list[tunnel.Instance]):
-        """Объём трафика повышает риск блокировки адреса — раз в день предупреждаем о превышении порога."""
-        today = datetime.now(config.TZ).date().isoformat()
-        day, rx, tx = report.day_traffic(self.state.data.get("traffic_day"), insts, today)
-        self.state["traffic_day"] = day
+    def log_online(self, inst: tunnel.Instance, now: float):
+        """Кто подключился и кто отключился с прошлой проверки — в журнал службы, с адресами."""
+        cur = {p.pubkey: p for p in inst.peers if tunnel.is_online(p, now)}
+        prev = self.online_keys.get(inst.container)
+        self.online_keys[inst.container] = set(cur)
+        if prev is None:  # первая проверка после старта — просто запоминаем
+            return
+        came = [f"{cur[k].label} ({cur[k].endpoint_ip or '?'})" for k in sorted(set(cur) - prev)]
+        names = {p.pubkey: p.label for p in inst.peers}
+        gone = [names.get(k, k[:8]) for k in sorted(prev - set(cur))]
+        if came or gone:
+            log.info("клиенты %s: в сети %d%s%s", inst.container, len(cur),
+                     f"; подключились: {', '.join(came)}" if came else "",
+                     f"; отключились: {', '.join(gone)}" if gone else "")
+
+    async def check_traffic(self, insts: list[tunnel.Instance], complete: bool = False):
+        """Учёт трафика клиентов (сохраняется со следующим сохранением состояния — в пределах минуты).
+        Объём трафика повышает риск блокировки адреса — раз в день предупреждаем о превышении порога."""
+        now = datetime.now(config.TZ)
+        today = now.date().isoformat()
+        led = report.account(self.state.data.get("traffic"), insts, now.timestamp(), complete)
+        self.state["traffic"] = led
+        self.state.data.pop("traffic_day", None)  # прежний учёт «за сегодня» от счётчиков туннеля
+        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        rx, tx = report.total_since(led, midnight)
         if rx + tx >= config.TRAFFIC_DAY_GB * 2**30 and self.state.data.get("traffic_warned") != today:
             if await self.send(f"📈 <b>Трафик за сегодня</b> уже {fmt_bytes(rx + tx)} (↓{fmt_bytes(tx)} ↑{fmt_bytes(rx)}): "
                                f"объём трафика повышает риск блокировки адреса",
@@ -265,13 +307,17 @@ class Alerts:
         """Обновления ставятся в отдельном юните; когда он закончился — сообщаем результат."""
         if "upgrade" not in self.state.data or manage.upgrade_running():
             return
-        self.state.data.pop("upgrade")
+        started = (self.state.data.pop("upgrade") or {}).get("started")
         self.state.save()
+        took = time.time() - started if started else None
         res = manage.upgrade_result()
         if res is None:
+            history.record(self.state, "установка обновлений", ok=False, detail="без результата", took=took)
             await self.send(f"⚠️ Установка обновлений завершилась без результата — см. {manage.UPGRADE_LOG}")
             return
         rc, tail = res
+        history.record(self.state, "установка обновлений", ok=rc == 0,
+                       detail="завершена" if rc == 0 else f"код {rc}", took=took)
         text = ("✅ <b>Обновления установлены</b>" if rc == 0
                 else f"🔴 <b>Установка обновлений завершилась с ошибкой</b> (код {rc})")
         if tail:
@@ -321,7 +367,7 @@ class Alerts:
                 problem = (f"{target} недоступен со всех {v.total} узлов check-host.net в {flag} ({how}), "
                            f"а с контрольных доступен ({v.ctl_ok}/{v.ctl_total})")
             await self.set("geo", v.down, f"доступ из {flag}", problem,
-                           sustain=config.GEO_SUSTAIN, markup=buttons(("🌍 Проверить по миру", "nv:geo")))
+                           sustain=config.GEO_SUSTAIN, markup=buttons(("🌍 Проверить по миру", "nv:geow")))
 
     async def run_geo(self):
         if not config.GEO_COUNTRY:
