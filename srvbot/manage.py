@@ -123,11 +123,33 @@ async def restart_unit(unit: str, any_unit: bool = False) -> None:
     await run("systemctl", "restart", name, timeout=120)
 
 
+_LOGFMT = {k: re.compile(rf'\b{k}=("(?:[^"\\]|\\.)*"|\S+)') for k in ("level", "msg", "error", "err", "error-response")}
+_LEVEL = {"error": "🔴", "fatal": "🔴", "panic": "🔴", "warning": "⚠️", "warn": "⚠️"}
+
+
+def compact_line(line: str) -> str:
+    """Строка journalctl -o short — короче, чтобы читалась на телефоне: «12:29:31 сообщение» без даты, хоста
+    и процесса; строки в формате logfmt (dockerd, containerd: time=… level=… msg=…) — «⚠️ msg: error».
+    Обрезаем до 200 символов: очень длинные строки в <pre> телефон может не отрисовать."""
+    m = re.match(r"\w{3} +\d+ (\d\d:\d\d:\d\d) \S+ [^\s:]+(?:\[\d+\])?: (.*)", line)
+    if not m:
+        return line[:200]
+    when, text = m.groups()
+    if "msg=" in text and "level=" in text:
+        f = {k: (r.search(text) or [None, ""])[1].strip('"').replace('\\"', '"') for k, r in _LOGFMT.items()}
+        err = f["error"] or f["err"] or f["error-response"]
+        text = " ".join(x for x in (_LEVEL.get(f["level"], ""), f["msg"] + (f": {err}" if err else "")) if x)
+    return f"{when} {text}"[:200]
+
+
 async def unit_logs(unit: str, n: int = 25) -> str:
     return await run("journalctl", "-u", unit_name(unit), "-n", str(n), "--no-pager", "-o", "short", check=False)
 
 
 async def container_logs(name: str, n: int = 25) -> str:
+    # сначала — включены ли логи: иначе каждое нажатие оставляло ошибку в журнале docker
+    if (await run("docker", "inspect", "--format", "{{.HostConfig.LogConfig.Type}}", name)).strip() == "none":
+        return await container_history(name, n)
     try:
         return await run("docker", "logs", "--tail", str(n), name, merge=True)
     except CmdError as e:

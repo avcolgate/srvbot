@@ -79,3 +79,17 @@ class ContainerHistory(unittest.TestCase):
         self.assertIn("перезапусков 3 (политика always), последний раз убит из-за нехватки памяти, последний код выхода 137", out)
         self.assertIn("уведомление: 🔴 контейнер box: упал", out)
         self.assertNotIn("журнал box", out)  # нажатия кнопок — не история контейнера
+
+
+class CompactLine(unittest.TestCase):
+    def test_logfmt_and_plain(self):
+        dockerd = ('Oct 21 16:05:20 host dockerd[963087]: time="2026-10-21T16:05:20.71+02:00" level=error '
+                   'msg="Handler for GET /containers/{name:.*}/logs returned error" '
+                   'error-response="configured logging driver does not support reading" method=GET module=api')
+        self.assertEqual(manage.compact_line(dockerd), "16:05:20 🔴 Handler for GET /containers/{name:.*}/logs "
+                                                        "returned error: configured logging driver does not support reading")
+        self.assertEqual(manage.compact_line("Oct 21 06:20:42 host fail2ban-server[1]: Server ready"),
+                         "06:20:42 Server ready")
+        self.assertEqual(manage.compact_line("Oct 21 06:20:41 host systemd[1]: Started x."), "06:20:41 Started x.")
+        self.assertLessEqual(len(manage.compact_line("Oct 21 06:20:41 host x[1]: " + "a" * 1000)), 200)
+        self.assertEqual(manage.compact_line("-- No entries --"), "-- No entries --")

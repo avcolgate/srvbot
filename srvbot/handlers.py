@@ -3,7 +3,6 @@ import logging
 import os
 import secrets
 import shutil
-import socket
 import time
 from datetime import datetime
 
@@ -240,11 +239,10 @@ class Handlers:
             out = await (manage.unit_logs(name) if what == "u" else manage.container_logs(name))
         except CmdError as e:
             out = f"ошибка: {e}"
-        host = socket.gethostname()
-        lines = [esc(line.replace(f" {host} ", " ")) for line in out.strip().splitlines()] or ["журнал пуст"]
+        raw = out.strip().splitlines()
+        lines = [esc(manage.compact_line(x) if what == "u" else x[:200]) for x in raw] or ["журнал пуст"]
         kept, size = [], 0  # с конца, уже экранированные строки — чтобы влезть в лимит Telegram
         for line in reversed(lines):
-            line = line[:300]
             if size + len(line) > 3300:
                 kept.append("…")
                 break
