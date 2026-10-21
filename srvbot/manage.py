@@ -18,7 +18,11 @@ from .util import CmdError, fmt_duration, run
 UPGRADE_UNIT = "srvbot-upgrade"
 UPGRADE_LOG = "/var/lib/srvbot/upgrade.log"  # папка только для root (в /var/log можно подменить ссылкой)
 UPGRADE_RC = "/var/lib/srvbot/upgrade.rc"
-APT_ENV = ("env", "DEBIAN_FRONTEND=noninteractive")
+# apt — в отдельном временном юните: даже симуляция берёт ~85 МБ и тянет в кэш базу пакетов, а в службе бота
+# это вместе с ним упиралось в лимит 300 МБ, и ядро вытесняло бота в swap (ответы по 10 с). Вывод и код
+# выхода systemd-run --wait --pipe передаёт как есть.
+APT_ENV = ("systemd-run", "--quiet", "--wait", "--pipe", "--collect", "--description=srvbot: apt",
+           "--setenv=DEBIAN_FRONTEND=noninteractive", "-p", "MemoryMax=400M")
 APT_OPTS = ("-o", "Dpkg::Options::=--force-confold", "-o", "Dpkg::Options::=--force-confdef")
 
 
@@ -119,11 +123,35 @@ async def restart_unit(unit: str, any_unit: bool = False) -> None:
     await run("systemctl", "restart", name, timeout=120)
 
 
+_LOGFMT = {k: re.compile(rf'\b{k}=("(?:[^"\\]|\\.)*"|\S+)') for k in ("level", "msg", "error", "err", "error-response")}
+_LEVEL = {"error": "🔴", "fatal": "🔴", "panic": "🔴", "warning": "⚠️", "warn": "⚠️"}
+
+
+def compact_line(line: str) -> str:
+    """Строка journalctl -o short-iso — короче, чтобы читалась на телефоне: «12:29:31 сообщение» без даты, хоста
+    и процесса, время — в часовом поясе бота (TIMEZONE), а не сервера; строки в формате logfmt (dockerd,
+    containerd: time=… level=… msg=…) — «⚠️ msg: error». Обрезаем до 200 символов: очень длинные строки
+    в <pre> телефон может не отрисовать."""
+    m = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d\d:?\d\d) \S+ [^\s:]+(?:\[\d+\])?: (.*)", line)
+    if not m:
+        return line[:200]
+    stamp, text = m.groups()
+    when = f"{datetime.fromisoformat(stamp).astimezone(config.TZ):%H:%M:%S}"
+    if "msg=" in text and "level=" in text:
+        f = {k: (r.search(text) or [None, ""])[1].strip('"').replace('\\"', '"') for k, r in _LOGFMT.items()}
+        err = f["error"] or f["err"] or f["error-response"]
+        text = " ".join(x for x in (_LEVEL.get(f["level"], ""), f["msg"] + (f": {err}" if err else "")) if x)
+    return f"{when} {text}"[:200]
+
+
 async def unit_logs(unit: str, n: int = 25) -> str:
-    return await run("journalctl", "-u", unit_name(unit), "-n", str(n), "--no-pager", "-o", "short", check=False)
+    return await run("journalctl", "-u", unit_name(unit), "-n", str(n), "--no-pager", "-o", "short-iso", check=False)
 
 
 async def container_logs(name: str, n: int = 25) -> str:
+    # сначала — включены ли логи: иначе каждое нажатие оставляло ошибку в журнале docker
+    if (await run("docker", "inspect", "--format", "{{.HostConfig.LogConfig.Type}}", name)).strip() == "none":
+        return await container_history(name, n)
     try:
         return await run("docker", "logs", "--tail", str(n), name, merge=True)
     except CmdError as e:

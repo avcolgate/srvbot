@@ -85,6 +85,12 @@ def api_call(token: str, method: str, params: dict, timeout: float = 30, files: 
         raise TGError(f"{method}: {data.get('description', resp.status)}")
 
 
+def _benign(e: TGError) -> bool:
+    """Правка, которую не нужно считать ошибкой: ничего не поменялось или её обогнала более новая
+    (быстрое переключение периодов картинки — показана последняя)."""
+    return "not modified" in str(e) or "canceled by new edit" in str(e)
+
+
 def kb(*rows: list[tuple]) -> dict:
     """Inline-клавиатура: kb([("Текст", "callback"), ("Текст", "callback", "danger"), ...], ...).
     Третий элемент — стиль кнопки: danger (красная), success (зелёная), primary (синяя)."""
@@ -111,9 +117,13 @@ class Bot:
 
     async def edit_photo(self, chat_id: int, message_id: int, jpeg: bytes, markup: dict | None = None):
         """Заменяет картинку в сообщении на месте (переключение периода графика)."""
-        await self.call("editMessageMedia", _timeout=60, _files={"photo": ("chart.jpg", jpeg, "image/jpeg")},
-                        chat_id=chat_id, message_id=message_id, media={"type": "photo", "media": "attach://photo"},
-                        reply_markup=markup)
+        try:
+            await self.call("editMessageMedia", _timeout=60, _files={"photo": ("chart.jpg", jpeg, "image/jpeg")},
+                            chat_id=chat_id, message_id=message_id,
+                            media={"type": "photo", "media": "attach://photo"}, reply_markup=markup)
+        except TGError as e:
+            if not _benign(e):
+                raise
 
     async def send_photo(self, chat_id: int, jpeg: bytes, caption: str = "", markup: dict | None = None):
         return await self.call("sendPhoto", _timeout=60, _files={"photo": ("chart.jpg", jpeg, "image/jpeg")},
@@ -144,7 +154,7 @@ class Bot:
         try:
             await self.call("editMessageText", chat_id=chat_id, message_id=message_id, reply_markup=markup, **params)
         except TGError as e:
-            if "not modified" not in str(e):
+            if not _benign(e):
                 raise
 
     async def drop_markup(self, chat_id: int, message_id: int):

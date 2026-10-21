@@ -300,10 +300,8 @@ async def bans() -> str:
 
 
 def _compact(line: str) -> str:
-    """«Oct 21 11:30:07 host python3[978844]: INFO srvbot.handlers: раздел …» → «11:30:07 раздел …»:
-    на телефоне строка журнала бота должна помещаться."""
-    return re.sub(r"^\w{3} +\d+ (\S+) \S+ (?:python3\[\d+\]: (?:INFO )?(?:srvbot\.\w+: )?|systemd\[1\]: )",
-                  r"\1 ", line)
+    """Строка журнала бота → «11:30:07 раздел …» (время — в поясе бота): на телефоне должна помещаться."""
+    return re.sub(r"^(\S+) (?:INFO )?srvbot\.\w+: ", r"\1 ", manage.compact_line(line))
 
 
 async def journals() -> str:
