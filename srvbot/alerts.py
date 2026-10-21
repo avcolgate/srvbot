@@ -1,10 +1,11 @@
 """Фоновые проверки: 🔴 при появлении проблемы, 🟢 при восстановлении, без повторов."""
 import asyncio
 import logging
+import re
 import time
 from datetime import datetime
 
-from . import checkhost, config, docker, manage, report, system, tunnel
+from . import checkhost, config, docker, history, manage, report, system, tunnel
 from .tg import Bot, kb
 from .util import RICH_LEN, CmdError, State, cut_html, esc, fmt_bytes, fmt_duration
 
@@ -36,10 +37,14 @@ class Alerts:
         self.online_prev: dict[str, int] = {}  # контейнер -> сколько клиентов было в сети на прошлой проверке
         self.mass_drop: set[str] = set()       # контейнеры, где все клиенты пропали разом
         self.shared_prev: dict[str, bool] = {} # контейнер -> клиенты в сети выходили с одного адреса
+        self.online_keys: dict[str, set[str]] = {}  # контейнер -> ключи клиентов в сети (для журнала службы)
         self.geo_nodes: dict = {}              # кэш узлов check-host для проверки из страны
 
     async def send(self, text: str, markup=None, reply_to: int | None = None, rich: bool = False) -> dict | None:
-        """Отправленное сообщение или None, если Telegram не принял."""
+        """Отправленное сообщение или None, если Telegram не принял. Каждое уведомление — и в журнал службы:
+        потом по нему можно восстановить, что и когда происходило."""
+        first = re.sub(r"<[^>]+>", "", text).strip().splitlines()
+        log.info("уведомление: %s", first[0][:300] if first else "")
         try:
             return await self.bot.send(config.OWNER_ID, cut_html(text, RICH_LEN if rich else 4000, rich), markup,
                                        reply_to, rich=rich)
@@ -236,6 +241,7 @@ class Alerts:
                            "шлёт пакеты, но рукопожатие не проходит — похоже, сеть режет начало соединения",
                            sustain=config.TUNNEL_STALL_CHECKS, markup=links)
             self.peer_rx[p.pubkey] = p.rx
+        self.log_online(inst, now)
         online = sum(tunnel.is_online(p, now) for p in inst.peers)
         prev = self.online_prev.get(inst.container, 0)
         self.online_prev[inst.container] = online
@@ -244,6 +250,9 @@ class Alerts:
             self.shared_prev[inst.container] = tunnel.shared_network(inst.peers, now)
         if tunnel.mass_drop(prev, online):
             self.mass_drop.add(inst.container)
+            log.warning("клиенты %s: пропали все %d разом; последние адреса: %s", inst.container, prev,
+                        ", ".join(f"{p.label} {p.endpoint_ip or '?'} ({fmt_duration(now - p.handshake)} назад)"
+                                  for p in inst.peers if p.handshake) or "нет")
         elif online:
             self.mass_drop.discard(inst.container)
         if shared:
@@ -258,6 +267,21 @@ class Alerts:
                 await self.check_geo(self.geo_nodes)
             except Exception:
                 log.exception("check geo after mass drop failed")
+
+    def log_online(self, inst: tunnel.Instance, now: float):
+        """Кто подключился и кто отключился с прошлой проверки — в журнал службы, с адресами."""
+        cur = {p.pubkey: p for p in inst.peers if tunnel.is_online(p, now)}
+        prev = self.online_keys.get(inst.container)
+        self.online_keys[inst.container] = set(cur)
+        if prev is None:  # первая проверка после старта — просто запоминаем
+            return
+        came = [f"{cur[k].label} ({cur[k].endpoint_ip or '?'})" for k in sorted(set(cur) - prev)]
+        names = {p.pubkey: p.label for p in inst.peers}
+        gone = [names.get(k, k[:8]) for k in sorted(prev - set(cur))]
+        if came or gone:
+            log.info("клиенты %s: в сети %d%s%s", inst.container, len(cur),
+                     f"; подключились: {', '.join(came)}" if came else "",
+                     f"; отключились: {', '.join(gone)}" if gone else "")
 
     async def check_traffic(self, insts: list[tunnel.Instance], complete: bool = False):
         """Учёт трафика клиентов (сохраняется со следующим сохранением состояния — в пределах минуты).
@@ -279,13 +303,17 @@ class Alerts:
         """Обновления ставятся в отдельном юните; когда он закончился — сообщаем результат."""
         if "upgrade" not in self.state.data or manage.upgrade_running():
             return
-        self.state.data.pop("upgrade")
+        started = (self.state.data.pop("upgrade") or {}).get("started")
         self.state.save()
+        took = time.time() - started if started else None
         res = manage.upgrade_result()
         if res is None:
+            history.record(self.state, "установка обновлений", ok=False, detail="без результата", took=took)
             await self.send(f"⚠️ Установка обновлений завершилась без результата — см. {manage.UPGRADE_LOG}")
             return
         rc, tail = res
+        history.record(self.state, "установка обновлений", ok=rc == 0,
+                       detail="завершена" if rc == 0 else f"код {rc}", took=took)
         text = ("✅ <b>Обновления установлены</b>" if rc == 0
                 else f"🔴 <b>Установка обновлений завершилась с ошибкой</b> (код {rc})")
         if tail:

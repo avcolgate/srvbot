@@ -279,3 +279,44 @@ async def bans() -> str:
         blocks.append(details(f"{esc(j.name)}: {len(j.banned_now)} адресов", table(rows)))
     blocks.append(p("<i>счётчики «всего» — с последнего запуска fail2ban</i>"))
     return "".join(blocks)
+
+
+def _compact(line: str) -> str:
+    """«Oct 21 11:30:07 host python3[978844]: INFO srvbot.handlers: раздел …» → «11:30:07 раздел …»:
+    на телефоне строка журнала бота должна помещаться."""
+    return re.sub(r"^\w{3} +\d+ (\S+) \S+ (?:python3\[\d+\]: (?:INFO )?(?:srvbot\.\w+: )?|systemd\[1\]: )",
+                  r"\1 ", line)
+
+
+async def journals() -> str:
+    """Сводка журналов за сутки: входы по SSH, системные ошибки, последние строки бота."""
+    blocks = [h("📜 Журналы за сутки"), h("🔑 SSH", 4)]
+    try:
+        ssh = await manage.ssh_summary()
+        if ssh["accepted"]:
+            blocks.append(table([[esc(user), f"<code>{esc(ip)}</code>", esc(how), str(n)]
+                                 for (user, ip, how), n in ssh["accepted"].most_common()],
+                                header=["вход", "откуда", "как", "раз"]))
+        else:
+            blocks.append(p("успешных входов не было"))
+        blocks.append(p(f"неудачных подключений {ssh['failed']} с {ssh['failed_ips']} адресов"
+                        if ssh["failed"] else "неудачных подключений не было"))
+    except CmdError as e:
+        blocks.append(p(f"🔴 {esc(e)}"))
+    blocks.append(h("⚠️ Системные ошибки", 4))
+    try:
+        total, top = await manage.errors_summary()
+        if total:
+            blocks.append(p(*[f"<b>{n}×</b> {esc(msg)}" for msg, n in top],
+                            f"<i>всего {total}" + (f", показаны {len(top)} самых частых" if len(top) > 1 else "") + "</i>"))
+        else:
+            blocks.append(p("ошибок не было"))
+    except CmdError as e:
+        blocks.append(p(f"🔴 {esc(e)}"))
+    try:
+        out = await manage.unit_logs("srvbot", 12)
+        lines = [esc(_compact(x)[:200]) for x in out.strip().splitlines()]
+        blocks.append(details("🤖 Бот — последние строки", "<pre>" + "\n".join(lines) + "</pre>"))
+    except CmdError as e:
+        blocks.append(p(f"🤖 бот: 🔴 {esc(e)}"))
+    return "".join(blocks)

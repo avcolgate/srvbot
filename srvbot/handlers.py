@@ -7,7 +7,7 @@ import socket
 import time
 from datetime import datetime
 
-from . import config, docker, manage, system, tunnel, views
+from . import config, docker, history, manage, system, tunnel, views
 from .alerts import Alerts
 from .tg import Bot, kb, reply_kb
 from .util import INTERACTIVE, RICH_LEN, CmdError, State, cut_html, esc, fmt_ago, fmt_bytes, p, tg_time
@@ -34,6 +34,7 @@ def bot_commands() -> list[tuple[str, str]]:
 
 CTL_TEXT = "<b>⚙️ Управление</b>\nВыберите раздел. Любое действие выполняется только после подтверждения."
 CTL_KB = kb([("📦 Обновления", "v:upd"), ("🧹 Очистка диска", "v:clean")],
+            [("🗒 История", "v:hist"), ("📜 Журналы", "v:logs")],
             [("⏻ Перезагрузить сервер", "go:reboot:")])
 
 # Действия с подтверждением: kind -> arg -> (что сделать, предупреждение, куда вернуться)
@@ -49,7 +50,10 @@ ACTIONS = {
 # Долгие разделы: сначала показываем «⏳», потом подменяем результатом
 SLOW = {"geo": views.GEO_WAIT}
 # Разделы в rich-формате (заголовки, таблицы, сворачиваемые блоки); остальное — обычные сообщения
-RICH = {"status", "tun", "geo", "bans"}
+RICH = {"status", "tun", "geo", "bans", "logs"}
+# Названия разделов для журнала службы
+VIEW_NAMES = {"status": "Сервер", "tun": "Клиенты", "geo": "Доступность", "bans": "Баны", "ctl": "Управление",
+              "upd": "Обновления", "clean": "Очистка диска", "hist": "История", "logs": "Журналы"}
 MAX_LEN = 4000
 
 
@@ -67,6 +71,34 @@ def cut(text: str, rich: bool = False) -> str:
     return cut_html(text, RICH_LEN if rich else MAX_LEN, rich)
 
 
+def describe_text(text: str) -> str:
+    """Сообщение владельца — понятными словами для журнала службы."""
+    text = text.strip()
+    if text.startswith("/"):
+        return f"команда {text.split()[0][:30]}"
+    view = next((k for k, v in BTN.items() if v == text), None)
+    return f"раздел «{VIEW_NAMES[view]}»" if view else f"сообщение {text[:30]!r}"
+
+
+def describe_data(data: str) -> str:
+    """Нажатие inline-кнопки — понятными словами для журнала службы."""
+    kind, _, arg = data.partition(":")
+    if kind in ("v", "nv"):
+        return f"раздел «{VIEW_NAMES.get(arg, arg)}»"
+    if kind in ("go", "ga"):
+        k, _, a = arg.partition(":")
+        return f"запрос подтверждения: {ACTIONS[k](a)[0]}" if k in ACTIONS else f"запрос подтверждения: {data[:40]}"
+    if kind == "do":
+        return "подтверждение действия"
+    if kind in ("lg", "la"):
+        return f"журнал {arg.partition(':')[2]}"
+    if kind == "ub":
+        jail, _, ip = arg.partition(":")
+        return f"разбан {ip} в {jail}"
+    return {"x": "отмена", "aptu": "проверка обновлений (apt update)", "fg": f"не следить: {arg[:40]}"}.get(
+        kind, f"кнопка {data[:40]!r}")
+
+
 class Handlers:
     def __init__(self, bot: Bot, state: State, alerts: Alerts):
         self.bot, self.state, self.alerts = bot, state, alerts
@@ -79,13 +111,20 @@ class Handlers:
         if msg := update.get("message"):
             if msg.get("from", {}).get("id") == config.OWNER_ID and msg.get("chat", {}).get("id") == config.OWNER_ID \
                     and "text" in msg:
-                log.info("update %s: %r", update.get("update_id"), msg["text"][:50])
-                await self.on_message(msg)
+                await self.logged(describe_text(msg["text"]), self.on_message(msg))
         elif cq := update.get("callback_query"):
             if cq.get("from", {}).get("id") == config.OWNER_ID \
                     and cq.get("message", {}).get("chat", {}).get("id") == config.OWNER_ID:
-                log.info("update %s: %r", update.get("update_id"), cq.get("data"))
-                await self.on_callback(cq)
+                await self.logged(describe_data(cq.get("data", "")), self.on_callback(cq))
+
+    @staticmethod
+    async def logged(what: str, coro):
+        """В журнал службы — что нажато, понятными словами, и сколько заняло."""
+        started = time.monotonic()
+        try:
+            await coro
+        finally:
+            log.info("%s — %.1f с", what, time.monotonic() - started)
 
     # --- представления ---
 
@@ -115,6 +154,11 @@ class Handlers:
             return await self.updates_view()
         if view == "clean":
             return await self.clean_view()
+        if view == "hist":
+            return history.view(self.state), kb([("⟳ Обновить", "v:hist")], [("◀ Управление", "v:ctl")])
+        if view == "logs":
+            return await views.journals(), kb([("⟳ Обновить", "v:logs"), ("🤖 Журнал бота", "lg:u:srvbot")],
+                                              [("◀ Управление", "v:ctl")])
         raise ValueError(view)
 
     async def updates_view(self) -> tuple[str, dict]:
@@ -264,11 +308,13 @@ class Handlers:
             jail, _, ip = arg.partition(":")
             try:
                 await system.unban(jail, ip)
+                history.record(self.state, f"разбан {ip}", detail=jail)
                 await self.bot.answer(cq["id"], f"{ip} разбанен", alert=True)
                 text, markup = await self.render("bans")  # кнопка «Разбанить» у адреса должна исчезнуть
                 await self.bot.edit(chat, mid, cut(text, True), markup, rich=True)
                 await self.bot.send(chat, f"✅ {esc(ip)} разбанен в {esc(jail)}")
             except CmdError as e:
+                history.record(self.state, f"разбан {ip}", ok=False, detail=str(e))
                 await self.bot.answer(cq["id"], f"Ошибка: {e}"[:200], alert=True)
         elif kind == "fg":
             what, _, key = arg.partition(":")
@@ -308,21 +354,23 @@ class Handlers:
         desc, _, back = ACTIONS[kind](arg)
         back_kb = kb([("◀ Назад", f"v:{back}")])
         await self.bot.answer(cq["id"])
+        started = time.monotonic()
         try:
             if kind == "reboot":
                 await self.bot.edit(chat, mid, "⏻ Перезагружаю сервер… Бот напишет, когда сервер поднимется.")
-                self.state.save()
+                history.record(self.state, desc, detail="запущена")
                 await asyncio.sleep(1)
                 await system.reboot()
                 return
             if kind == "upgrade":
                 await manage.start_upgrade()
                 self.state["upgrade"] = {"started": time.time()}
-                self.state.save()
+                history.record(self.state, desc, detail="запущена в фоне, результат — отдельной записью")
                 await self.bot.edit(chat, mid, "⏳ Устанавливаю обновления в фоне. Результат придёт отдельным "
                                                "сообщением (обычно 1–5 минут).", back_kb)
                 return
         except CmdError as e:
+            history.record(self.state, desc, ok=False, detail=str(e))
             await self.bot.edit(chat, mid, f"🔴 Ошибка ({esc(desc)}): {esc(e)}", back_kb)
             return
         await self.bot.edit(chat, mid, f"⏳ {esc(desc)}…")
@@ -337,9 +385,13 @@ class Handlers:
                 before = manage.disk_free()
                 done = await manage.clean()
                 freed = max(0, manage.disk_free() - before)
+                history.record(self.state, desc, detail=f"освобождено {fmt_bytes(freed)}",
+                               took=time.monotonic() - started)
                 await self.bot.edit(chat, mid, f"✅ <b>Очистка завершена</b> — освобождено {fmt_bytes(freed)}\n"
                                     + "\n".join(f"• {esc(d)}" for d in done), back_kb)
                 return
+            history.record(self.state, desc, took=time.monotonic() - started)
             await self.bot.edit(chat, mid, f"✅ Выполнено: {esc(desc)}", back_kb)
         except CmdError as e:
+            history.record(self.state, desc, ok=False, detail=str(e), took=time.monotonic() - started)
             await self.bot.edit(chat, mid, f"🔴 Ошибка ({esc(desc)}): {esc(e)}", back_kb)
